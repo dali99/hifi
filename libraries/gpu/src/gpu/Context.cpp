@@ -8,6 +8,7 @@
 //  Distributed under the Apache License, Version 2.0.
 //  See the accompanying file LICENSE or http://www.apache.org/licenses/LICENSE-2.0.html
 //
+#include <limits>
 #include "Context.h"
 
 #include <shared/GlobalAppProperties.h>
@@ -18,19 +19,28 @@
 
 using namespace gpu;
 
+template<typename T>
+T subWrap(T endValue, T beginValue) {
+    if (endValue >= beginValue) {
+        return endValue - beginValue;
+    } else {
+        return endValue + ((std::numeric_limits<T>::max() - beginValue) + 1);
+    }
+}
+
 void ContextStats::evalDelta(const ContextStats& begin, const ContextStats& end) {
-    _ISNumFormatChanges = end._ISNumFormatChanges - begin._ISNumFormatChanges;
-    _ISNumInputBufferChanges = end._ISNumInputBufferChanges - begin._ISNumInputBufferChanges;
-    _ISNumIndexBufferChanges = end._ISNumIndexBufferChanges - begin._ISNumIndexBufferChanges;
+    _ISNumFormatChanges = subWrap<uint32_t>(end._ISNumFormatChanges, begin._ISNumFormatChanges);
+    _ISNumInputBufferChanges = subWrap<uint32_t>(end._ISNumInputBufferChanges, begin._ISNumInputBufferChanges);
+    _ISNumIndexBufferChanges = subWrap<uint32_t>(end._ISNumIndexBufferChanges, begin._ISNumIndexBufferChanges);
 
-    _RSNumTextureBounded = end._RSNumTextureBounded - begin._RSNumTextureBounded;
-    _RSAmountTextureMemoryBounded = end._RSAmountTextureMemoryBounded - begin._RSAmountTextureMemoryBounded;
+    _RSNumTextureBounded = subWrap<uint32_t>(end._RSNumTextureBounded, begin._RSNumTextureBounded);
+    _RSAmountTextureMemoryBounded = subWrap<uint64_t>(end._RSAmountTextureMemoryBounded, begin._RSAmountTextureMemoryBounded);
 
-    _DSNumAPIDrawcalls = end._DSNumAPIDrawcalls - begin._DSNumAPIDrawcalls;
-    _DSNumDrawcalls = end._DSNumDrawcalls - begin._DSNumDrawcalls;
-    _DSNumTriangles= end._DSNumTriangles - begin._DSNumTriangles;
+    _DSNumAPIDrawcalls = subWrap<uint32_t>(end._DSNumAPIDrawcalls, begin._DSNumAPIDrawcalls);
+    _DSNumDrawcalls = subWrap<uint32_t>(end._DSNumDrawcalls, begin._DSNumDrawcalls);
+    _DSNumTriangles= subWrap<uint32_t>(end._DSNumTriangles, begin._DSNumTriangles);
 
-    _PSNumSetPipelines = end._PSNumSetPipelines - begin._PSNumSetPipelines;
+    _PSNumSetPipelines = subWrap<uint32_t>(end._PSNumSetPipelines, begin._PSNumSetPipelines);
 }
 
 
@@ -47,10 +57,7 @@ Context::Context(const Context& context) {
 }
 
 Context::~Context() {
-    for (auto batch : _batchPool) {
-        delete batch;
-    }
-    _batchPool.clear();
+    clearBatches();
     _syncedPrograms.clear();
 }
 
@@ -97,6 +104,12 @@ FramePointer Context::endFrame() {
     return result;
 }
 
+void Context::executeBatch(const char* name, std::function<void(Batch&)> lambda) const {
+    auto batch = acquireBatch(name);
+    lambda(*batch);
+    executeBatch(*batch);
+}
+
 void Context::executeBatch(Batch& batch) const {
     PROFILE_RANGE(render_gpu, __FUNCTION__);
     batch.flush();
@@ -117,28 +130,27 @@ void Context::executeFrame(const FramePointer& frame) const {
     PROFILE_RANGE(render_gpu, __FUNCTION__);
 
     // Grab the stats at the around the frame and delta to have a consistent sampling
-    ContextStats beginStats;
+    static ContextStats beginStats;
     getStats(beginStats);
 
     // FIXME? probably not necessary, but safe
     consumeFrameUpdates(frame);
     _backend->setStereoState(frame->stereoState);
-    {
-        Batch beginBatch("Context::executeFrame::begin");
-        _frameRangeTimer->begin(beginBatch);
-        _backend->render(beginBatch);
 
-        // Execute the frame rendering commands
-        for (auto& batch : frame->batches) {
-            _backend->render(*batch);
-        }
-
-        Batch endBatch("Context::executeFrame::end");
-        _frameRangeTimer->end(endBatch);
-        _backend->render(endBatch);
+    executeBatch("Context::executeFrame::begin", [&](Batch& batch){
+        batch.pushProfileRange("Frame");
+        _frameRangeTimer->begin(batch);
+    });
+    // Execute the frame rendering commands
+    for (auto& batch : frame->batches) {
+        _backend->render(*batch);
     }
+    executeBatch("Context::executeFrame::end", [&](Batch& batch){
+        batch.popProfileRange();
+        _frameRangeTimer->end(batch);
+    });
 
-    ContextStats endStats;
+    static ContextStats endStats;
     getStats(endStats);
     _frameStats.evalDelta(beginStats, endStats);
 }
@@ -208,7 +220,7 @@ double Context::getFrameTimerBatchAverage() const {
 const Backend::TransformCamera& Backend::TransformCamera::recomputeDerived(const Transform& xformView) const {
     _projectionInverse = glm::inverse(_projection);
 
-    // Get the viewEyeToWorld matrix form the transformView as passed to the gpu::Batch
+    // Get the viewEyeToWorld matrix from the transformView as passed to the gpu::Batch
     // this is the "_viewInverse" fed to the shader
     // Genetrate the "_view" matrix as well from the xform
     xformView.getMatrix(_viewInverse);
@@ -381,6 +393,16 @@ void Context::processProgramsToSync() {
     }
 }
 
+std::mutex Context::_batchPoolMutex;
+std::list<Batch*> Context::_batchPool;
+
+void Context::clearBatches() {
+    for (auto batch : _batchPool) {
+        delete batch;
+    }
+    _batchPool.clear();
+}
+
 BatchPointer Context::acquireBatch(const char* name) {
     Batch* rawBatch = nullptr;
     {
@@ -393,8 +415,10 @@ BatchPointer Context::acquireBatch(const char* name) {
     if (!rawBatch) {
         rawBatch = new Batch();
     }
-    rawBatch->setName(name);
-    return BatchPointer(rawBatch, [this](Batch* batch) { releaseBatch(batch); });
+    if (name) {
+        rawBatch->setName(name);
+    }
+    return BatchPointer(rawBatch, [](Batch* batch) { releaseBatch(batch); });
 }
 
 void Context::releaseBatch(Batch* batch) {
@@ -406,7 +430,7 @@ void Context::releaseBatch(Batch* batch) {
 void gpu::doInBatch(const char* name,
                     const std::shared_ptr<gpu::Context>& context,
                     const std::function<void(Batch& batch)>& f) {
-    auto batch = context->acquireBatch(name);
+    auto batch = Context::acquireBatch(name);
     f(*batch);
     context->appendFrameBatch(batch);
 }

@@ -27,6 +27,10 @@
 #include "GLHelpers.h"
 #include "QOpenGLContextWrapper.h"
 
+#if defined(GL_CUSTOM_CONTEXT)
+#include <QtPlatformHeaders/QWGLNativeContext>
+#endif
+
 using namespace gl;
 
 #if defined(GL_CUSTOM_CONTEXT)
@@ -34,28 +38,18 @@ bool Context::USE_CUSTOM_CONTEXT { true };
 #endif
 
 bool Context::enableDebugLogger() {
-#if defined(Q_OS_MAC)
-    // OSX does not support GL_KHR_debug or GL_ARB_debug_output
-    return false;
-#else
-#if defined(DEBUG) || defined(USE_GLES)
-    static bool enableDebugLogger = true;
-#else
-    static const QString DEBUG_FLAG("HIFI_DEBUG_OPENGL");
-    static bool enableDebugLogger = QProcessEnvironment::systemEnvironment().contains(DEBUG_FLAG);
-#endif
-    return enableDebugLogger;
-#endif
+    return gl::debugContextEnabled();
 }
-
-
 
 std::atomic<size_t> Context::_totalSwapchainMemoryUsage { 0 };
 
 size_t Context::getSwapchainMemoryUsage() { return _totalSwapchainMemoryUsage.load(); }
 
 size_t Context::evalSurfaceMemoryUsage(uint32_t width, uint32_t height, uint32_t pixelSize) {
-    return width * height * pixelSize;
+    size_t result = width;
+    result *= height;
+    result *= pixelSize;
+    return result;
 }
 
 void Context::updateSwapchainMemoryUsage(size_t prevSize, size_t newSize) {
@@ -139,7 +133,7 @@ void Context::clear() {
 #if defined(GL_CUSTOM_CONTEXT)
 
 static void setupPixelFormatSimple(HDC hdc) {
-    // FIXME build the PFD based on the 
+    // FIXME build the PFD based on the
     static const PIXELFORMATDESCRIPTOR pfd =    // pfd Tells Windows How We Want Things To Be
     {
         sizeof(PIXELFORMATDESCRIPTOR),         // Size Of This Pixel Format Descriptor
@@ -189,6 +183,7 @@ static void setupPixelFormatSimple(HDC hdc) {
 #define WGL_CONTEXT_PROFILE_MASK_ARB 0x9126
 
 // Context create flag bits
+#define WGL_CONTEXT_ROBUST_ACCESS_BIT_ARB 0x00000004
 #define WGL_CONTEXT_DEBUG_BIT_ARB 0x00000001
 #define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
 #define WGL_CONTEXT_ES2_PROFILE_BIT_EXT 0x00000004
@@ -207,6 +202,21 @@ GLAPI PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB;
 
 
 Q_GUI_EXPORT QOpenGLContext *qt_gl_global_share_context();
+
+#if defined(GL_CUSTOM_CONTEXT)
+bool Context::makeCurrent() {
+    BOOL result = wglMakeCurrent(_hdc, _hglrc);
+    assert(result);
+    updateSwapchainMemoryCounter();
+    return result;
+}
+void Context::swapBuffers() {
+    SwapBuffers(_hdc);
+}
+void Context::doneCurrent() {
+    wglMakeCurrent(0, 0);
+}
+#endif
 
 void Context::create(QOpenGLContext* shareContext) {
     if (!shareContext) {
@@ -303,22 +313,33 @@ void Context::create(QOpenGLContext* shareContext) {
 #else
             contextAttribs.push_back(WGL_CONTEXT_CORE_PROFILE_BIT_ARB);
 #endif
-            contextAttribs.push_back(WGL_CONTEXT_FLAGS_ARB);
-            if (enableDebugLogger()) {
-                contextAttribs.push_back(WGL_CONTEXT_DEBUG_BIT_ARB);
-            } else {
-                contextAttribs.push_back(0);
+            {
+                int contextFlags = 0;
+                if (enableDebugLogger()) {
+                    contextFlags |= WGL_CONTEXT_DEBUG_BIT_ARB;
+                }
+#ifdef USE_KHR_ROBUSTNESS
+                contextFlags |= WGL_CONTEXT_ROBUST_ACCESS_BIT_ARB;
+#endif
+                if (contextFlags != 0) {
+                    contextAttribs.push_back(WGL_CONTEXT_FLAGS_ARB);
+                    contextAttribs.push_back(contextFlags);
+                }
             }
             contextAttribs.push_back(0);
-            HGLRC shareHglrc = (HGLRC)QOpenGLContextWrapper::nativeContext(shareContext);
+            HGLRC shareHglrc = nullptr;
+            if (shareContext) {
+                auto nativeContextPointer = QOpenGLContextWrapper(shareContext).getNativeContext();
+                shareHglrc = (HGLRC)nativeContextPointer->context();
+            }
             _hglrc = wglCreateContextAttribsARB(_hdc, shareHglrc, &contextAttribs[0]);
         }
 
         if (_hglrc != 0) {
             createWrapperContext();
         }
-    } 
-    
+    }
+
     if (_hglrc == 0) {
         // fallback, if the context creation failed, or USE_CUSTOM_CONTEXT is false
         qtCreate(shareContext);

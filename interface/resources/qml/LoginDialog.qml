@@ -13,14 +13,13 @@ import QtQuick 2.4
 import controlsUit 1.0 as HifiControlsUit
 import stylesUit 1.0 as HifiStylesUit
 
-import "LoginDialog"
-
 FocusScope {
     id: root
-    HifiStylesUit.HifiConstants { id: hifi }
     objectName: "LoginDialog"
     property bool shown: true
     visible: shown
+
+    HifiStylesUit.HifiConstants { id: hifi }
 
     anchors.fill: parent
 
@@ -33,11 +32,16 @@ FocusScope {
     property bool keyboardRaised: false
     property bool punctuationMode: false
     property bool isPassword: false
-    property string title: ""
-    property string text: ""
-    property int titleWidth: 0
+
     property alias bannerWidth: banner.width
     property alias bannerHeight: banner.height
+
+    property string title: ""
+    property string text: ""
+
+    property int titleWidth: 0
+
+    property bool isHMD: HMD.active
 
     function tryDestroy() {
         root.destroy()
@@ -54,7 +58,8 @@ FocusScope {
     Image {
         z: -10
         id: loginDialogBackground
-        source: "LoginDialog/images/background.jpg"
+        fillMode: Image.PreserveAspectCrop
+        source: "LoginDialog/images/background.png"
         anchors.fill: parent
     }
 
@@ -119,6 +124,6 @@ FocusScope {
     }
 
     Component.onCompleted: {
-        bodyLoader.setSource("LoginDialog/LinkAccountBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "linkSteam": false });
+        bodyLoader.setSource("LoginDialog/LinkAccountBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "linkSteam": false, "linkOculus": false });
     }
 }

@@ -20,6 +20,8 @@ public:
     static const float DEFAULT_INTENSITY;
     static const float DEFAULT_FALLOFF_RADIUS;
     static const float DEFAULT_EXPONENT;
+    static const float MIN_CUTOFF;
+    static const float MAX_CUTOFF;
     static const float DEFAULT_CUTOFF;
 
     static EntityItemPointer factory(const EntityItemID& entityID, const EntityItemProperties& properties);
@@ -72,11 +74,8 @@ public:
     static bool getLightsArePickable() { return _lightsArePickable; }
     static void setLightsArePickable(bool value) { _lightsArePickable = value; }
     
-    virtual void locationChanged(bool tellPhysics) override;
+    virtual void locationChanged(bool tellPhysics, bool tellChildren) override;
     virtual void dimensionsChanged() override;
-
-    bool lightPropertiesChanged() const { return _lightPropertiesChanged; }
-    void resetLightPropertiesChanged();
 
     virtual bool supportsDetailedIntersection() const override { return true; }
     virtual bool findDetailedRayIntersection(const glm::vec3& origin, const glm::vec3& direction,
@@ -96,8 +95,6 @@ private:
     float _falloffRadius { DEFAULT_FALLOFF_RADIUS };
     float _exponent { DEFAULT_EXPONENT };
     float _cutoff { DEFAULT_CUTOFF };
-    // Dirty flag turn true when either light properties is changing values.
-    bool _lightPropertiesChanged { false };
 
     static bool _lightsArePickable;
 };

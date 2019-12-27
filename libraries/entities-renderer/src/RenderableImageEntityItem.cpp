@@ -26,7 +26,7 @@ ImageEntityRenderer::~ImageEntityRenderer() {
 }
 
 bool ImageEntityRenderer::isTransparent() const {
-    return Parent::isTransparent() || (_textureIsLoaded && _texture->getGPUTexture() && _texture->getGPUTexture()->getUsage().isAlpha()) || _alpha < 1.0f;
+    return Parent::isTransparent() || (_textureIsLoaded && _texture->getGPUTexture() && _texture->getGPUTexture()->getUsage().isAlpha()) || _alpha < 1.0f || _pulseProperties.getAlphaMode() != PulseMode::NONE;
 }
 
 bool ImageEntityRenderer::needsRenderUpdate() const {
@@ -39,42 +39,6 @@ bool ImageEntityRenderer::needsRenderUpdate() const {
     }
 
     return Parent::needsRenderUpdate();
-}
-
-bool ImageEntityRenderer::needsRenderUpdateFromTypedEntity(const TypedEntityPointer& entity) const {
-    bool needsUpdate = resultWithReadLock<bool>([&] {
-        if (_imageURL != entity->getImageURL()) {
-            return true;
-        }
-
-        if (_emissive != entity->getEmissive()) {
-            return true;
-        }
-
-        if (_keepAspectRatio != entity->getKeepAspectRatio()) {
-            return true;
-        }
-
-        if (_billboardMode != entity->getBillboardMode()) {
-            return true;
-        }
-
-        if (_subImage != entity->getSubImage()) {
-            return true;
-        }
-
-        if (_color != entity->getColor()) {
-            return true;
-        }
-
-        if (_alpha != entity->getAlpha()) {
-            return true;
-        }
-
-        return false;
-    });
-
-    return needsUpdate;
 }
 
 void ImageEntityRenderer::doRenderUpdateSynchronousTyped(const ScenePointer& scene, Transaction& transaction, const TypedEntityPointer& entity) {
@@ -92,11 +56,12 @@ void ImageEntityRenderer::doRenderUpdateSynchronousTyped(const ScenePointer& sce
 
         _emissive = entity->getEmissive();
         _keepAspectRatio = entity->getKeepAspectRatio();
-        _billboardMode = entity->getBillboardMode();
         _subImage = entity->getSubImage();
 
         _color = entity->getColor();
         _alpha = entity->getAlpha();
+        _pulseProperties = entity->getPulseProperties();
+        _billboardMode = entity->getBillboardMode();
 
         if (!_textureIsLoaded && _texture && _texture->isLoaded()) {
             _textureIsLoaded = true;
@@ -106,11 +71,22 @@ void ImageEntityRenderer::doRenderUpdateSynchronousTyped(const ScenePointer& sce
     void* key = (void*)this;
     AbstractViewStateInterface::instance()->pushPostUpdateLambda(key, [this, entity]() {
         withWriteLock([&] {
-            _dimensions = entity->getScaledDimensions();
             updateModelTransformAndBound();
             _renderTransform = getModelTransform();
+            _renderTransform.postScale(entity->getScaledDimensions());
         });
     });
+}
+
+Item::Bound ImageEntityRenderer::getBound() {
+    auto bound = Parent::getBound();
+    if (_billboardMode != BillboardMode::NONE) {
+        glm::vec3 dimensions = bound.getScale();
+        float max = glm::max(dimensions.x, glm::max(dimensions.y, dimensions.z));
+        const float SQRT_2 = 1.41421356237f;
+        bound.setScaleStayCentered(glm::vec3(SQRT_2 * max));
+    }
+    return bound;
 }
 
 ShapeKey ImageEntityRenderer::getShapeKey() {
@@ -123,6 +99,10 @@ ShapeKey ImageEntityRenderer::getShapeKey() {
         if (_emissive) {
             builder.withUnlit();
         }
+
+        if (_primitiveMode == PrimitiveMode::LINES) {
+            builder.withWireframe();
+        }
     });
 
     return builder.build();
@@ -131,46 +111,24 @@ ShapeKey ImageEntityRenderer::getShapeKey() {
 void ImageEntityRenderer::doRender(RenderArgs* args) {
     NetworkTexturePointer texture;
     QRect subImage;
-    glm::u8vec3 color;
-    glm::vec3 dimensions;
+    glm::vec4 color;
     Transform transform;
     withReadLock([&] {
         texture = _texture;
         subImage = _subImage;
-        color = _color;
-        dimensions = _dimensions;
+        color = glm::vec4(toGlm(_color), _alpha);
+        color = EntityRenderer::calculatePulseColor(color, _pulseProperties, _created);
         transform = _renderTransform;
     });
 
-    if (!_visible || !texture || !texture->isLoaded()) {
+    if (!_visible || !texture || !texture->isLoaded() || color.a == 0.0f) {
         return;
     }
 
     Q_ASSERT(args->_batch);
     gpu::Batch* batch = args->_batch;
 
-    if (_billboardMode == BillboardMode::YAW) {
-        //rotate about vertical to face the camera
-        glm::vec3 dPosition = args->getViewFrustum().getPosition() - transform.getTranslation();
-        // If x and z are 0, atan(x, z) is undefined, so default to 0 degrees
-        float yawRotation = dPosition.x == 0.0f && dPosition.z == 0.0f ? 0.0f : glm::atan(dPosition.x, dPosition.z);
-        glm::quat orientation = glm::quat(glm::vec3(0.0f, yawRotation, 0.0f));
-        transform.setRotation(orientation);
-    } else if (_billboardMode == BillboardMode::FULL) {
-        glm::vec3 billboardPos = transform.getTranslation();
-        glm::vec3 cameraPos = args->getViewFrustum().getPosition();
-        // use the referencial from the avatar, y isn't always up
-        glm::vec3 avatarUP = EntityTreeRenderer::getAvatarUp();
-        // check to see if glm::lookAt will work / using glm::lookAt variable name
-        glm::highp_vec3 s(glm::cross(billboardPos - cameraPos, avatarUP));
-
-        // make sure s is not NaN for any component
-        if (glm::length2(s) > 0.0f) {
-            glm::quat rotation(conjugate(toQuat(glm::lookAt(cameraPos, billboardPos, avatarUP))));
-            transform.setRotation(rotation);
-        }
-    }
-    transform.postScale(dimensions);
+    transform.setRotation(EntityItem::getBillboardRotation(transform.getTranslation(), transform.getRotation(), _billboardMode, args->getViewFrustum().getPosition()));
 
     batch->setModelTransform(transform);
     batch->setResourceTexture(0, texture->getGPUTexture());
@@ -199,19 +157,14 @@ void ImageEntityRenderer::doRender(RenderArgs* args) {
 
     float maxSize = glm::max(fromImage.width(), fromImage.height());
     float x = _keepAspectRatio ? fromImage.width() / (2.0f * maxSize) : 0.5f;
-    float y = _keepAspectRatio ? -fromImage.height() / (2.0f * maxSize) : -0.5f;
+    float y = _keepAspectRatio ? fromImage.height() / (2.0f * maxSize) : 0.5f;
 
-    glm::vec2 topLeft(-x, -y);
-    glm::vec2 bottomRight(x, y);
-    glm::vec2 texCoordTopLeft((fromImage.x() + 0.5f) / imageWidth, (fromImage.y() + 0.5f) / imageHeight);
-    glm::vec2 texCoordBottomRight((fromImage.x() + fromImage.width() - 0.5f) / imageWidth,
-                                  (fromImage.y() + fromImage.height() - 0.5f) / imageHeight);
-
-    glm::vec4 imageColor(toGlm(color), _alpha);
+    glm::vec2 texCoordBottomLeft((fromImage.x() + 0.5f) / imageWidth, (fromImage.y() + fromImage.height() - 0.5f) / imageHeight);
+    glm::vec2 texCoordTopRight((fromImage.x() + fromImage.width() - 0.5f) / imageWidth, (fromImage.y() + 0.5f) / imageHeight);
 
     DependencyManager::get<GeometryCache>()->renderQuad(
-        *batch, topLeft, bottomRight, texCoordTopLeft, texCoordBottomRight,
-        imageColor, _geometryId
+        *batch, glm::vec2(-x, -y), glm::vec2(x, y), texCoordBottomLeft, texCoordTopRight,
+        color, _geometryId
     );
 
     batch->setResourceTexture(0, nullptr);

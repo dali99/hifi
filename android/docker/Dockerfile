@@ -26,10 +26,9 @@ RUN mkdir -p "$ANDROID_HOME" "$ANDROID_SDK_HOME" && \
     curl -s -S -o sdk.zip -L "${SDK_URL}" && \
     unzip sdk.zip && \
     rm sdk.zip && \
-    yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses
+    yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses && yes | $ANDROID_HOME/tools/bin/sdkmanager --update
 
 # Install Android Build Tool and Libraries
-RUN $ANDROID_HOME/tools/bin/sdkmanager --update
 RUN $ANDROID_HOME/tools/bin/sdkmanager "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
     "platforms;android-${ANDROID_VERSION}" \
     "platform-tools"
@@ -52,11 +51,14 @@ ENV PATH ${PATH}:${ANDROID_NDK_HOME}
 RUN apt-get -y install \
     g++ \
     gcc \
+    sudo \
+    emacs-nox \
     -
 
 # --- Gradle
 ARG BUILD_UID=1001
 RUN useradd -ms /bin/bash -u $BUILD_UID jenkins
+RUN echo "jenkins ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 USER jenkins
 WORKDIR /home/jenkins
 
@@ -69,24 +71,24 @@ RUN mkdir "$HIFI_BASE" && \
     mkdir "$HIFI_VCPKG_BASE" && \ 
     mkdir "$HIFI_ANDROID_PRECOMPILED"
 
-RUN git clone https://github.com/jherico/hifi.git && \
+# Checkout a relatively recent commit from the main repository and use it to cache the 
+# gradle and vcpkg dependencies
+# This commit ID should be updated whenever someone changes the dependency list
+# in cmake/ports
+RUN git clone https://github.com/highfidelity/hifi.git && \
     cd ~/hifi && \
-    git checkout feature/build/gradle-wrapper 
-
+    git checkout 796bfb5d6715ff14c2e60f3ee8fac1465b7578c6
 
 WORKDIR /home/jenkins/hifi
-
-RUN touch .test4 && \ 
-    git fetch && git reset origin/feature/build/gradle-wrapper --hard
 
 RUN mkdir build
 
 # Pre-cache the vcpkg managed dependencies
 WORKDIR /home/jenkins/hifi/build
-RUN python3 ../prebuild.py --build-root `pwd` --android
+RUN python3 ../prebuild.py --build-root `pwd` --android interface
 
 # Pre-cache the gradle dependencies
 WORKDIR /home/jenkins/hifi/android
 RUN ./gradlew -m tasks -PHIFI_ANDROID_PRECOMPILED=$HIFI_ANDROID_PRECOMPILED
-RUN ./gradlew extractDependencies -PHIFI_ANDROID_PRECOMPILED=$HIFI_ANDROID_PRECOMPILED 
+#RUN ./gradlew extractDependencies -PHIFI_ANDROID_PRECOMPILED=$HIFI_ANDROID_PRECOMPILED 
 

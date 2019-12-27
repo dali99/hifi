@@ -14,13 +14,11 @@
 
 class PythonInterface {
 public:
-    PythonInterface();
-
     QString getPythonCommand();
 
 private:
 #ifdef Q_OS_WIN
-    const QString _pythonExe{ "python.exe" };
+    const QString _pythonExe{ "py.exe" };
 #else
     // Both Mac and Linux use "python"
     const QString _pythonExe{ "python" };

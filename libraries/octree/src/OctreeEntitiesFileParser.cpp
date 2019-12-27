@@ -9,13 +9,15 @@
 //  See the accompanying file LICENSE or http://www.apache.org/licenses/LICENSE-2.0.html
 //
 
+#include "OctreeEntitiesFileParser.h"
+
 #include <sstream>
 #include <cctype>
+
 #include <QUuid>
 #include <QJsonDocument>
 #include <QJsonObject>
 
-#include "OctreeEntitiesFileParser.h"
 
 using std::string;
 
@@ -95,7 +97,7 @@ bool OctreeEntitiesFileParser::parseEntities(QVariantMap& parsedEntities) {
                 _errorString = "Duplicate Id entries";
                 return false;
             }
-
+            gotId = true;
             if (nextToken() != '"') {
                 _errorString = "Invalid Id value";
                 return false;
@@ -105,14 +107,21 @@ bool OctreeEntitiesFileParser::parseEntities(QVariantMap& parsedEntities) {
                 _errorString = "Invalid Id string";
                 return false;
             }
-            QUuid idValue = QUuid::fromString(QLatin1String(idString.c_str()) );
-            if (idValue.isNull()) {
-                _errorString = "Id value invalid UUID string: " + idString;
-                return false;
-            }
 
-            parsedEntities["Id"] = idValue;
-            gotId = true;
+            // some older archives may have a null string id, so
+            // return success without setting parsedEntities,
+            // which will result in a new uuid for the restored
+            // archive.  (not parsing and using isNull as parsing
+            // results in null if there is a corrupt string)
+
+            if (idString != "{00000000-0000-0000-0000-000000000000}") {
+                QUuid idValue = QUuid::fromString(QLatin1String(idString.c_str()) );
+                if (idValue.isNull()) {
+                    _errorString = "Id value invalid UUID string: " + idString;
+                    return false;
+                }
+                parsedEntities["Id"] = idValue;
+            }
         } else if (key == "Version") {
             if (gotVersion) {
                 _errorString = "Duplicate Version entries";

@@ -36,11 +36,14 @@ Item {
     property bool keyboardRaised: false
     property bool punctuationMode: false
 
-    property bool withSteam: false
+    property bool withSteam: withSteam
     property bool linkSteam: linkSteam
-    property bool withOculus: false
+    property bool withOculus: withOculus
+    property bool linkOculus: linkOculus
     property string errorString: errorString
     property bool lostFocus: false
+
+    readonly property bool loginDialogPoppedUp: loginDialog.getLoginDialogPoppedUp()
 
     QtObject {
         id: d
@@ -68,26 +71,45 @@ Item {
 
     function login() {
         loginDialog.login(emailField.text, passwordField.text);
-        bodyLoader.setSource("LoggingInBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "withSteam": linkAccountBody.withSteam, "withOculus": linkAccountBody.withOculus, "linkSteam": linkAccountBody.linkSteam });
+        if (linkAccountBody.loginDialogPoppedUp) {
+            var data;
+            if (linkAccountBody.linkSteam) {
+                data = {
+                    "action": "user linking hifi account with Steam"
+                };
+            } else {
+                data = {
+                    "action": "user logging in"
+                };
+            }
+            UserActivityLogger.logAction("encourageLoginDialog", data);
+        }
+        bodyLoader.setSource("LoggingInBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "withSteam": linkAccountBody.withSteam,
+            "withOculus": linkAccountBody.withOculus, "linkSteam": linkAccountBody.linkSteam, "linkOculus": linkAccountBody.linkOculus,
+            "displayName":displayNameField.text });
     }
 
     function init() {
         // going to/from sign in/up dialog.
-        loginDialog.isLogIn = true;
         loginErrorMessage.text = linkAccountBody.errorString;
         loginErrorMessage.visible = (linkAccountBody.errorString  !== "");
-        loginButton.text = !linkAccountBody.linkSteam ? "Log In" : "Link Account";
+        if (loginErrorMessageTextMetrics.width > displayNameField.width) {
+            loginErrorMessage.wrapMode = Text.WordWrap;
+            errorContainer.height = (loginErrorMessageTextMetrics.width / displayNameField.width) * loginErrorMessageTextMetrics.height;
+        }
+        loginButton.text = (!linkAccountBody.linkSteam && !linkAccountBody.linkOculus) ? "Log In" : "Link Account";
         loginButton.color = hifi.buttons.blue;
+        displayNameField.placeholderText = "Display Name (optional)";
+        var savedDisplayName = Settings.getValue("Avatar/displayName", "");
+        displayNameField.text = savedDisplayName;
         emailField.placeholderText = "Username or Email";
         var savedUsername = Settings.getValue("keepMeLoggedIn/savedUsername", "");
         emailField.text = keepMeLoggedInCheckbox.checked ? savedUsername === "Unknown user" ? "" : savedUsername : "";
-        if (linkAccountBody.linkSteam) {
-            steamInfoText.anchors.top = passwordField.bottom;
-            keepMeLoggedInCheckbox.anchors.top = steamInfoText.bottom;
+        if (linkAccountBody.linkSteam || linkAccountBody.linkOculus) {
             loginButton.width = (passwordField.width - hifi.dimensions.contentSpacing.x) / 2;
-            loginButton.anchors.right = emailField.right;
+            loginButton.anchors.right = displayNameField.right;
         } else {
-            loginButton.anchors.left = emailField.left;
+            loginButton.anchors.left = displayNameField.left;
         }
         loginContainer.visible = true;
     }
@@ -107,24 +129,24 @@ Item {
 
         Item {
             id: loginContainer
-            width: emailField.width
-            height: errorContainer.height + emailField.height + passwordField.height + 5.5 * hifi.dimensions.contentSpacing.y +
-                keepMeLoggedInCheckbox.height + loginButton.height + cantAccessTextMetrics.height + continueButton.height + steamInfoTextMetrics.height
+            width: displayNameField.width
+            height: errorContainer.height + displayNameField.height + emailField.height + passwordField.height + 5.5 * hifi.dimensions.contentSpacing.y +
+                keepMeLoggedInCheckbox.height + loginButton.height + cantAccessTextMetrics.height + continueButton.height
             anchors {
                 top: parent.top
                 topMargin: root.bannerHeight + 0.25 * parent.height
                 left: parent.left
-                leftMargin: (parent.width - emailField.width) / 2
+                leftMargin: (parent.width - displayNameField.width) / 2
             }
 
             Item {
                 id: errorContainer
-                width: loginErrorMessageTextMetrics.width
+                width: parent.width
                 height: loginErrorMessageTextMetrics.height
                 anchors {
-                    bottom: emailField.top;
+                    bottom: displayNameField.top;
                     bottomMargin: hifi.dimensions.contentSpacing.y;
-                    left: emailField.left;
+                    left: displayNameField.left;
                 }
                 TextMetrics {
                     id: loginErrorMessageTextMetrics
@@ -145,7 +167,7 @@ Item {
             }
 
             HifiControlsUit.TextField {
-                id: emailField
+                id: displayNameField
                 width: root.bannerWidth
                 height: linkAccountBody.textFieldHeight
                 font.pixelSize: linkAccountBody.textFieldFontSize
@@ -153,6 +175,45 @@ Item {
                 anchors {
                     top: parent.top
                     topMargin: errorContainer.height
+                }
+                placeholderText: "Display Name (optional)"
+                activeFocusOnPress: true
+                Keys.onPressed: {
+                    switch (event.key) {
+                        case Qt.Key_Tab:
+                            event.accepted = true;
+                            emailField.focus = true;
+                            break;
+                        case Qt.Key_Backtab:
+                            event.accepted = true;
+                            passwordField.focus = true;
+                            break;
+                        case Qt.Key_Enter:
+                        case Qt.Key_Return:
+                            event.accepted = true;
+                            if (keepMeLoggedInCheckbox.checked) {
+                                Settings.setValue("keepMeLoggedIn/savedUsername", emailField.text);
+                            }
+                            linkAccountBody.login();
+                            break;
+                    }
+                }
+                onFocusChanged: {
+                    root.text = "";
+                    if (focus) {
+                        root.isPassword = false;
+                    }
+                }
+            }
+            HifiControlsUit.TextField {
+                id: emailField
+                width: root.bannerWidth
+                height: linkAccountBody.textFieldHeight
+                font.pixelSize: linkAccountBody.textFieldFontSize
+                styleRenderType: Text.QtRendering
+                anchors {
+                    top: displayNameField.bottom
+                    topMargin: 1.5 * hifi.dimensions.contentSpacing.y
                 }
                 placeholderText: "Username or Email"
                 activeFocusOnPress: true
@@ -164,7 +225,7 @@ Item {
                             break;
                         case Qt.Key_Backtab:
                             event.accepted = true;
-                            passwordField.focus = true;
+                            displayNameField.focus = true;
                             break;
                         case Qt.Key_Enter:
                         case Qt.Key_Return:
@@ -239,6 +300,9 @@ Item {
                 Keys.onPressed: {
                     switch (event.key) {
                         case Qt.Key_Tab:
+                            event.accepted = true;
+                            displayNameField.focus = true;
+                            break;
                         case Qt.Key_Backtab:
                             event.accepted = true;
                             emailField.focus = true;
@@ -288,13 +352,20 @@ Item {
                 fontSize: linkAccountBody.fontSize
                 fontBold: linkAccountBody.fontBold
                 color: hifi.buttons.noneBorderlessWhite;
-                visible: linkAccountBody.linkSteam
+                visible: linkAccountBody.linkSteam || linkAccountBody.linkOculus
                 anchors {
                     top: keepMeLoggedInCheckbox.bottom
                     topMargin: hifi.dimensions.contentSpacing.y
                 }
                 onClicked: {
-                    bodyLoader.setSource("CompleteProfileBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "withSteam": linkAccountBody.withSteam, "errorString": "" });
+                    if (linkAccountBody.loginDialogPoppedUp) {
+                        var data = {
+                            "action": "user clicked cancel at link account screen"
+                        };
+                        UserActivityLogger.logAction("encourageLoginDialog", data);
+                    }
+                    bodyLoader.setSource("CompleteProfileBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "withSteam": linkAccountBody.withSteam,
+                        "withOculus": linkAccountBody.withOculus, "errorString": "" });
                 }
             }
             HifiControlsUit.Button {
@@ -310,34 +381,7 @@ Item {
                     topMargin: hifi.dimensions.contentSpacing.y
                 }
                 onClicked: {
-                    linkAccountBody.login()
-                }
-            }
-            TextMetrics {
-                id: steamInfoTextMetrics
-                font: steamInfoText.font
-                text: steamInfoText.text
-            }
-            Text {
-                id: steamInfoText
-                width: root.bannerWidth
-                visible: linkAccountBody.linkSteam
-                anchors {
-                    top: loginButton.bottom
-                    topMargin: hifi.dimensions.contentSpacing.y
-                    left: emailField.left
-                }
-
-                font.family: linkAccountBody.fontFamily
-                font.pixelSize: linkAccountBody.textFieldFontSize
-                color: "white"
-                text: qsTr("Your Steam account information will not be exposed to others.");
-                verticalAlignment: Text.AlignVCenter
-                horizontalAlignment: Text.AlignHCenter
-                Component.onCompleted: {
-                    if (steamInfoTextMetrics.width > root.bannerWidth) {
-                        steamInfoText.wrapMode = Text.WordWrap;
-                    }
+                    linkAccountBody.login();
                 }
             }
             TextMetrics {
@@ -348,11 +392,11 @@ Item {
             HifiStylesUit.ShortcutText {
                 id: cantAccessText
                 z: 10
-                visible: !linkAccountBody.linkSteam
+                visible: !linkAccountBody.linkSteam && !linkAccountBody.linkOculus
                 anchors {
                     top: loginButton.bottom
                     topMargin: hifi.dimensions.contentSpacing.y
-                    left: emailField.left
+                    left: displayNameField.left
                 }
                 font.family: linkAccountBody.fontFamily
                 font.pixelSize: linkAccountBody.textFieldFontSize
@@ -365,7 +409,7 @@ Item {
                 linkColor: hifi.colors.blueAccent
                 onLinkActivated: {
                     Tablet.playSound(TabletEnums.ButtonClick);
-                    loginDialog.openUrl(link);
+                    Window.openUrl(link);
                     lightboxPopup.titleText = "Can't Access Account";
                     lightboxPopup.bodyText = lightboxPopup.cantAccessBodyText;
                     lightboxPopup.button2text = "CLOSE";
@@ -373,18 +417,23 @@ Item {
                         lightboxPopup.visible = false;
                     }
                     lightboxPopup.visible = true;
-                    // bodyLoader.setSource("CantAccessBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader });
+                    if (linkAccountBody.loginDialogPoppedUp) {
+                        var data = {
+                            "action": "user clicked can't access account"
+                        };
+                        UserActivityLogger.logAction("encourageLoginDialog", data);
+                    }
                 }
             }
             HifiControlsUit.Button {
                 id: continueButton;
-                width: emailField.width;
+                width: displayNameField.width;
                 height: d.minHeightButton
                 color: hifi.buttons.none;
                 anchors {
                     top: cantAccessText.bottom
                     topMargin: hifi.dimensions.contentSpacing.y
-                    left: emailField.left
+                    left: displayNameField.left
                 }
                 text: qsTr("CONTINUE WITH STEAM")
                 fontFamily: linkAccountBody.fontFamily
@@ -394,28 +443,41 @@ Item {
                 buttonGlyphSize: 24
                 buttonGlyphRightMargin: 10
                 onClicked: {
-                    // if (loginDialog.isOculusStoreRunning()) {
-                    //     linkAccountBody.withOculus = true;
-                    //     loginDialog.loginThroughSteam();
-                    // } else
+                    if (loginDialog.isOculusRunning()) {
+                        linkAccountBody.withOculus = true;
+                        loginDialog.loginThroughOculus();
+                    } else
                     if (loginDialog.isSteamRunning()) {
                         linkAccountBody.withSteam = true;
                         loginDialog.loginThroughSteam();
                     }
+                    if (linkAccountBody.loginDialogPoppedUp) {
+                        var data;
+                        if (linkAccountBody.withOculus) {
+                            data = {
+                                "action": "user clicked login through Oculus"
+                            };
+                        } else if (linkAccountBody.withSteam) {
+                            data = {
+                                "action": "user clicked login through Steam"
+                            };
+                        }
+                        UserActivityLogger.logAction("encourageLoginDialog", data);
+                    }
 
                     bodyLoader.setSource("LoggingInBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader,
-                        "withSteam": linkAccountBody.withSteam, "withOculus": linkAccountBody.withOculus, "linkSteam": linkAccountBody.linkSteam });
+                        "withSteam": linkAccountBody.withSteam, "withOculus": linkAccountBody.withOculus, "linkSteam": linkAccountBody.linkSteam, "linkOculus": linkAccountBody.linkOculus,
+                        "displayName":displayNameField.text});
                 }
                 Component.onCompleted: {
-                    if (linkAccountBody.linkSteam) {
+                    if (linkAccountBody.linkSteam || linkAccountBody.linkOculus) {
                         continueButton.visible = false;
                         return;
                     }
-                    // if (loginDialog.isOculusStoreRunning()) {
-                    //     continueButton.text = qsTr("CONTINUE WITH OCULUS");
-                    //     continueButton.buttonGlyph = hifi.glyphs.oculus;
-                    // } else
-                    if (loginDialog.isSteamRunning()) {
+                    if (loginDialog.isOculusRunning()) {
+                        continueButton.text = qsTr("CONTINUE WITH OCULUS");
+                        continueButton.buttonGlyph = hifi.glyphs.oculus;
+                    } else if (loginDialog.isSteamRunning()) {
                         continueButton.text = qsTr("CONTINUE WITH STEAM");
                         continueButton.buttonGlyph = hifi.glyphs.steamSquare;
                     } else {
@@ -428,7 +490,7 @@ Item {
             id: signUpContainer
             width: loginContainer.width
             height: signUpTextMetrics.height
-            visible: !linkAccountBody.linkSteam
+            visible: !linkAccountBody.linkSteam && !linkAccountBody.linkOculus
             anchors {
                 left: loginContainer.left
                 top: loginContainer.bottom
@@ -470,8 +532,14 @@ Item {
                 linkColor: hifi.colors.blueAccent
                 onLinkActivated: {
                     Tablet.playSound(TabletEnums.ButtonClick);
+                    if (linkAccountBody.loginDialogPoppedUp) {
+                        var data = {
+                            "action": "user clicked sign up button"
+                        };
+                        UserActivityLogger.logAction("encourageLoginDialog", data);
+                    }
                     bodyLoader.setSource("SignUpBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader,
-                        "errorString": "", "linkSteam": linkAccountBody.linkSteam });
+                        "errorString": "" });
                 }
             }
         }
@@ -495,10 +563,9 @@ Item {
             fontFamily: linkAccountBody.fontFamily
             fontSize: linkAccountBody.fontSize
             fontBold: linkAccountBody.fontBold
-            visible: loginDialog.getLoginDialogPoppedUp() && !linkAccountBody.linkSteam;
+            visible: loginDialog.getLoginDialogPoppedUp() && !linkAccountBody.linkSteam && !linkAccountBody.linkOculus;
             onClicked: {
-                if (loginDialog.getLoginDialogPoppedUp()) {
-                    console.log("[ENCOURAGELOGINDIALOG]: user dismissed login screen")
+                if (linkAccountBody.loginDialogPoppedUp) {
                     var data = {
                         "action": "user dismissed login screen"
                     };
@@ -515,7 +582,7 @@ Item {
         onFocusEnabled: {
             if (!linkAccountBody.lostFocus) {
                 Qt.callLater(function() {
-                    emailField.forceActiveFocus();
+                    displayNameField.forceActiveFocus();
                 });
             }
         }
@@ -523,6 +590,7 @@ Item {
             linkAccountBody.lostFocus = !root.isTablet && !root.isOverlay;
             if (linkAccountBody.lostFocus) {
                 Qt.callLater(function() {
+                    displayNameField.focus = false;
                     emailField.focus = false;
                     passwordField.focus = false;
                 });
@@ -538,7 +606,7 @@ Item {
         d.resize();
         init();
         Qt.callLater(function() {
-            emailField.forceActiveFocus();
+            displayNameField.forceActiveFocus();
         });
     }
 

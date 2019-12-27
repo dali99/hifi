@@ -8,36 +8,35 @@
 //  See the accompanying file LICENSE or http://www.apache.org/licenses/LICENSE-2.0.html
 //
 #include "PythonInterface.h"
+#include <PathUtils.h>
 
 #include <QFile>
 #include <QMessageBox>
-#include <QProcess>
 
-PythonInterface::PythonInterface() {
+QString PythonInterface::getPythonCommand() {
 #ifdef Q_OS_WIN
-    if (QProcessEnvironment::systemEnvironment().contains("PYTHON_PATH")) {
-        QString _pythonPath = QProcessEnvironment::systemEnvironment().value("PYTHON_PATH");
-        if (!QFile::exists(_pythonPath + "/" + _pythonExe)) {
-            QMessageBox::critical(0, _pythonExe, QString("Python executable not found in ") + _pythonPath);
+    if (_pythonCommand.isNull()) {
+        // Use the python launcher as we need python 3, and python 2 may be installed
+        // See https://www.python.org/dev/peps/pep-0397/
+        const QString pythonLauncherExecutable{ "py.exe" };
+        QString pythonPath = PathUtils::getPathToExecutable(pythonLauncherExecutable);
+        if (!pythonPath.isNull()) {
+            _pythonCommand = pythonPath + _pythonExe;
+        }
+        else {
+            QMessageBox::critical(0, pythonLauncherExecutable + " not found",
+                "Please verify that py.exe is in the PATH");
             exit(-1);
         }
-        
-        _pythonCommand = _pythonPath + "/" + _pythonExe;
-    } else {
-        QMessageBox::critical(0, "PYTHON_PATH not defined",
-                              "Please set PYTHON_PATH to directory containing the Python executable");
-        exit(-1);
     }
 #elif defined Q_OS_MAC
     _pythonCommand = "/usr/local/bin/python3";
     if (!QFile::exists(_pythonCommand)) {
-        QMessageBox::critical(0, "PYTHON_PATH not defined",
-                              "python3 not found at " + _pythonCommand);
+        QMessageBox::critical(0, "python not found",
+            "python3 not found at " + _pythonCommand);
         exit(-1);
     }
 #endif
-}
 
-QString PythonInterface::getPythonCommand() {
     return _pythonCommand;
 }

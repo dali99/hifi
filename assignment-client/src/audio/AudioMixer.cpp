@@ -17,6 +17,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QJsonValue>
+#include <shared/QtHelpers.h>
 
 #include <LogHandler.h>
 #include <NetworkAccessManager.h>
@@ -68,6 +69,13 @@ AudioMixer::AudioMixer(ReceivedMessage& message) :
     // hash the available codecs (on the mixer)
     _availableCodecs.clear(); // Make sure struct is clean
     auto pluginManager = DependencyManager::set<PluginManager>();
+    // Only load codec plugins; for now assume codec plugins have 'codec' in their name.
+    auto codecPluginFilter = [](const QJsonObject& metaData) {
+        QJsonValue nameValue = metaData["MetaData"]["name"];
+        return nameValue.toString().contains("codec", Qt::CaseInsensitive);
+    };
+    pluginManager->setPluginFilter(codecPluginFilter);
+
     auto codecPlugins = pluginManager->getCodecPlugins();
     for_each(codecPlugins.cbegin(), codecPlugins.cend(),
         [&](const CodecPluginPointer& codec) {
@@ -90,7 +98,9 @@ AudioMixer::AudioMixer(ReceivedMessage& message) :
             PacketType::RadiusIgnoreRequest,
             PacketType::RequestsDomainListData,
             PacketType::PerAvatarGainSet,
-            PacketType::AudioSoloRequest },
+            PacketType::InjectorGainSet,
+            PacketType::AudioSoloRequest,
+            PacketType::StopInjector },
             this, "queueAudioPacket");
 
     // packets whose consequences are global should be processed on the main thread
@@ -238,7 +248,8 @@ void AudioMixer::removeHRTFsForFinishedInjector(const QUuid& streamID) {
 
     if (injectorClientData) {
         // stage the removal of this stream, workers handle when preparing mixes for listeners
-        _workerSharedData.removedStreams.emplace_back(injectorClientData->getNodeID(), injectorClientData->getNodeLocalID(),
+        _workerSharedData.removedStreams.emplace_back(injectorClientData->getNodeID(),
+                                                      injectorClientData->getNodeLocalID(),
                                                       streamID);
     }
 }
@@ -258,6 +269,13 @@ void AudioMixer::sendStatsPacket() {
     if (_numStatFrames == 0) {
         return;
     }
+
+#ifdef DEBUG_EVENT_QUEUE
+    QJsonObject qtStats;
+
+    _slavePool.queueStats(qtStats);
+    statsObject["audio_thread_event_queue"] = qtStats;
+#endif
 
     // general stats
     statsObject["useDynamicJitterBuffers"] = _numStaticJitterFrames == DISABLE_STATIC_JITTER_FRAMES;
@@ -338,7 +356,7 @@ void AudioMixer::sendStatsPacket() {
             QJsonObject nodeStats;
             QString uuidString = uuidStringWithoutCurlyBraces(node->getUUID());
 
-            nodeStats["outbound_kbps"] = node->getOutboundBandwidth();
+            nodeStats["outbound_kbps"] = node->getOutboundKbps();
             nodeStats[USERNAME_UUID_REPLACEMENT_STATS_KEY] = uuidString;
 
             nodeStats["jitter"] = clientData->getAudioStreamStats();
@@ -578,8 +596,8 @@ void AudioMixer::parseSettingsObject(const QJsonObject& settingsObject) {
         // check the payload to see if we have asked for dynamicJitterBuffer support
         const QString DYNAMIC_JITTER_BUFFER_JSON_KEY = "dynamic_jitter_buffer";
         bool enableDynamicJitterBuffer = audioBufferGroupObject[DYNAMIC_JITTER_BUFFER_JSON_KEY].toBool();
-        if (enableDynamicJitterBuffer) {
-            qCDebug(audio) << "Enabling dynamic jitter buffers.";
+        if (!enableDynamicJitterBuffer) {
+            qCDebug(audio) << "Disabling dynamic jitter buffers.";
 
             bool ok;
             const QString DESIRED_JITTER_BUFFER_FRAMES_KEY = "static_desired_jitter_buffer_frames";
@@ -589,7 +607,7 @@ void AudioMixer::parseSettingsObject(const QJsonObject& settingsObject) {
             }
             qCDebug(audio) << "Static desired jitter buffer frames:" << _numStaticJitterFrames;
         } else {
-            qCDebug(audio) << "Disabling dynamic jitter buffers.";
+            qCDebug(audio) << "Enabling dynamic jitter buffers.";
             _numStaticJitterFrames = DISABLE_STATIC_JITTER_FRAMES;
         }
 
@@ -736,7 +754,7 @@ void AudioMixer::parseSettingsObject(const QJsonObject& settingsObject) {
                     float coefficient = coefficientObject.value(COEFFICIENT).toString().toFloat(&ok);
 
 
-                    if (ok && coefficient >= 0.0f && coefficient <= 1.0f &&
+                    if (ok && coefficient <= 1.0f &&
                         itSource != end(_audioZones) &&
                         itListener != end(_audioZones)) {
 

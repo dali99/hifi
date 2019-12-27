@@ -38,15 +38,15 @@ struct GLTFAsset {
 
 struct GLTFNode {
     QString name;
-    int camera;
-    int mesh;
+    int camera{ -1 };
+    int mesh{ -1 };
     QVector<int> children;
     QVector<double> translation;
     QVector<double> rotation;
     QVector<double> scale;
     QVector<double> matrix;
-    QVector<glm::mat4> transforms;
-    int skin;
+    glm::mat4 transform;
+    int skin { -1 };
     QVector<int> skeletons;
     QString jointName;
     QMap<QString, bool> defined;
@@ -85,6 +85,8 @@ struct GLTFNode {
             qCDebug(modelformat) << "skeletons: " << skeletons;
         }
     }
+
+    void normalizeTransform();
 };
 
 // Meshes
@@ -159,9 +161,20 @@ struct GLTFMeshPrimitive {
     }
 };
 
+struct GLTFMeshExtra {
+    QVector<QString> targetNames;
+    QMap<QString, bool> defined;
+    void dump() {
+        if (defined["targetNames"]) {
+            qCDebug(modelformat) << "targetNames: " << targetNames;
+        }
+    }
+};
+
 struct GLTFMesh {
     QString name;
     QVector<GLTFMeshPrimitive> primitives;
+    GLTFMeshExtra extras;
     QVector<double> weights;
     QMap<QString, bool> defined;
     void dump() {
@@ -171,6 +184,10 @@ struct GLTFMesh {
         if (defined["primitives"]) {
             qCDebug(modelformat) << "primitives: ";
             foreach(auto prim, primitives) prim.dump();
+        }
+        if (defined["extras"]) {
+            qCDebug(modelformat) << "extras: ";
+            extras.dump();
         }
         if (defined["weights"]) {
             qCDebug(modelformat) << "weights: " << weights;
@@ -214,7 +231,7 @@ struct GLTFBufferView {
 struct GLTFBuffer {
     int byteLength; //required
     QString uri;
-    QByteArray blob;
+    hifi::ByteArray blob;
     QMap<QString, bool> defined;
     void dump() {
         if (defined["byteLength"]) {
@@ -401,21 +418,13 @@ struct GLTFpbrMetallicRoughness {
     }
 };
 
-namespace GLTFMaterialAlphaMode {
-    enum Values {
-        OPAQUE = 0,
-        MASK,
-        BLEND
-    };
-};
-
 struct GLTFMaterial {
     QString name;
     QVector<double> emissiveFactor;
     int emissiveTexture;
     int normalTexture;
     int occlusionTexture;
-    int alphaMode;
+    graphics::MaterialKey::OpacityMapMode alphaMode;
     double alphaCutoff;
     bool doubleSided;
     GLTFpbrMetallicRoughness pbrMetallicRoughness;
@@ -436,6 +445,12 @@ struct GLTFMaterial {
         if (defined["emissiveFactor"]) {
             qCDebug(modelformat) << "emissiveFactor: " << emissiveFactor;
         }
+        if (defined["alphaMode"]) {
+            qCDebug(modelformat) << "alphaMode: " << alphaMode;
+        }
+        if (defined["alphaCutoff"]) {
+            qCDebug(modelformat) << "alphaCutoff: " << alphaCutoff;
+        }
         if (defined["pbrMetallicRoughness"]) {
             pbrMetallicRoughness.dump();
         }
@@ -445,15 +460,56 @@ struct GLTFMaterial {
 // Accesors
 
 namespace GLTFAccessorType {
-    enum Values {
-        SCALAR = 0,
-        VEC2,
-        VEC3,
-        VEC4,
-        MAT2,
-        MAT3,
-        MAT4
+    enum Value {
+        SCALAR = 1,
+        VEC2 = 2,
+        VEC3 = 3,
+        VEC4 = 4,
+        MAT2 = 5,
+        MAT3 = 9,
+        MAT4 = 16
     };
+
+    inline int count(Value value) {
+        if (value == MAT2) {
+            return 4;
+        }
+        return (int)value;
+    }
+}
+
+namespace GLTFVertexAttribute {
+    enum Value {
+        UNKNOWN = -1,
+        POSITION = 0, 
+        NORMAL, 
+        TANGENT, 
+        TEXCOORD_0, 
+        TEXCOORD_1, 
+        COLOR_0, 
+        JOINTS_0, 
+        WEIGHTS_0,
+    };
+    inline Value fromString(const QString& key) {
+        if (key == "POSITION") {
+            return POSITION;
+        } else if (key == "NORMAL") {
+            return NORMAL;
+        } else if (key == "TANGENT") {
+            return TANGENT;
+        } else if (key == "TEXCOORD_0") {
+            return TEXCOORD_0;
+        } else if (key == "TEXCOORD_1") {
+            return TEXCOORD_1;
+        } else if (key == "COLOR_0") {
+            return COLOR_0;
+        } else if (key == "JOINTS_0") {
+            return JOINTS_0;
+        } else if (key == "WEIGHTS_0") {
+            return WEIGHTS_0;
+        }
+        return UNKNOWN;
+    }
 }
 namespace GLTFAccessorComponentType {
     enum Values {
@@ -466,6 +522,49 @@ namespace GLTFAccessorComponentType {
     };
 }
 struct GLTFAccessor {
+    struct GLTFAccessorSparse {
+        struct GLTFAccessorSparseIndices {
+            int bufferView;
+            int byteOffset{ 0 };
+            int componentType;
+
+            QMap<QString, bool> defined;
+            void dump() {
+                if (defined["bufferView"]) {
+                    qCDebug(modelformat) << "bufferView: " << bufferView;
+                }
+                if (defined["byteOffset"]) {
+                    qCDebug(modelformat) << "byteOffset: " << byteOffset;
+                }
+                if (defined["componentType"]) {
+                    qCDebug(modelformat) << "componentType: " << componentType;
+                }
+            }
+        };
+        struct GLTFAccessorSparseValues {
+            int bufferView;
+            int byteOffset{ 0 };
+
+            QMap<QString, bool> defined;
+            void dump() {
+                if (defined["bufferView"]) {
+                    qCDebug(modelformat) << "bufferView: " << bufferView;
+                }
+                if (defined["byteOffset"]) {
+                    qCDebug(modelformat) << "byteOffset: " << byteOffset;
+                }
+            }
+        };
+
+        int count;
+        GLTFAccessorSparseIndices indices;
+        GLTFAccessorSparseValues values;
+
+        QMap<QString, bool> defined;
+        void dump() {
+        
+        }
+    };
     int bufferView;
     int byteOffset { 0 };
     int componentType; //required
@@ -474,6 +573,7 @@ struct GLTFAccessor {
     bool normalized{ false };
     QVector<double> max;
     QVector<double> min;
+    GLTFAccessorSparse sparse;
     QMap<QString, bool> defined;
     void dump() {
         if (defined["bufferView"]) {
@@ -505,6 +605,10 @@ struct GLTFAccessor {
             foreach(float m, min) {
                 qCDebug(modelformat) << m;
             }
+        }
+        if (defined["sparse"]) {
+            qCDebug(modelformat) << "sparse: ";
+            sparse.dump();
         }
     }
 };
@@ -697,6 +801,13 @@ struct GLTFFile {
             foreach(auto tex, textures) tex.dump();
         }
     }
+
+
+    void populateMaterialNames();
+    void sortNodes();
+    void normalizeNodeTransforms();
+private:
+    void reorderNodes(const std::unordered_map<int, int>& reorderMap);
 };
 
 class GLTFSerializer : public QObject, public HFMSerializer {
@@ -705,15 +816,18 @@ public:
     MediaType getMediaType() const override;
     std::unique_ptr<hfm::Serializer::Factory> getFactory() const override;
 
-    HFMModel::Pointer read(const QByteArray& data, const QVariantHash& mapping, const QUrl& url = QUrl()) override;
+    HFMModel::Pointer read(const hifi::ByteArray& data, const hifi::VariantHash& mapping, const hifi::URL& url = hifi::URL()) override;
 private:
     GLTFFile _file;
-    QUrl _url;
+    hifi::URL _url;
+    hifi::ByteArray _glbBinary;
 
-    glm::mat4 getModelTransform(const GLTFNode& node);
+    const glm::mat4& getModelTransform(const GLTFNode& node);
+    void getSkinInverseBindMatrices(std::vector<std::vector<float>>& inverseBindMatrixValues);
+    void generateTargetData(int index, float weight, QVector<glm::vec3>& returnVector);
 
-    bool buildGeometry(HFMModel& hfmModel, const QUrl& url);
-    bool parseGLTF(const QByteArray& data);
+    bool buildGeometry(HFMModel& hfmModel, const hifi::VariantHash& mapping, const hifi::URL& url);
+    bool parseGLTF(const hifi::ByteArray& data);
     
     bool getStringVal(const QJsonObject& object, const QString& fieldname, 
                       QString& value, QMap<QString, bool>&  defined);
@@ -731,8 +845,10 @@ private:
                            QVector<double>& values, QMap<QString, bool>&  defined);
     bool getObjectArrayVal(const QJsonObject& object, const QString& fieldname, 
                            QJsonArray& objects, QMap<QString, bool>& defined);
+
+    hifi::ByteArray setGLBChunks(const hifi::ByteArray& data);
     
-    int getMaterialAlphaMode(const QString& type);
+    graphics::MaterialKey::OpacityMapMode getMaterialAlphaMode(const QString& type);
     int getAccessorType(const QString& type);
     int getAnimationSamplerInterpolation(const QString& interpolation);
     int getCameraType(const QString& type);
@@ -743,6 +859,11 @@ private:
                             int& outidx, QMap<QString, bool>& defined);
 
     bool setAsset(const QJsonObject& object);
+
+    GLTFAccessor::GLTFAccessorSparse::GLTFAccessorSparseIndices createAccessorSparseIndices(const QJsonObject& object);
+    GLTFAccessor::GLTFAccessorSparse::GLTFAccessorSparseValues createAccessorSparseValues(const QJsonObject& object);
+    GLTFAccessor::GLTFAccessorSparse createAccessorSparse(const QJsonObject& object);
+
     bool addAccessor(const QJsonObject& object);
     bool addAnimation(const QJsonObject& object);
     bool addBufferView(const QJsonObject& object);
@@ -757,27 +878,36 @@ private:
     bool addSkin(const QJsonObject& object);
     bool addTexture(const QJsonObject& object);
 
-    bool readBinary(const QString& url, QByteArray& outdata);
+    bool readBinary(const QString& url, hifi::ByteArray& outdata);
 
     template<typename T, typename L>
-    bool readArray(const QByteArray& bin, int byteOffset, int count, 
+    bool readArray(const hifi::ByteArray& bin, int byteOffset, int count,
                    QVector<L>& outarray, int accessorType);
-    
+
     template<typename T>
-    bool addArrayOfType(const QByteArray& bin, int byteOffset, int count, 
+    bool addArrayOfType(const hifi::ByteArray& bin, int byteOffset, int count,
                         QVector<T>& outarray, int accessorType, int componentType);
+
+    template <typename T>
+    bool addArrayFromAccessor(GLTFAccessor& accessor, QVector<T>& outarray);
+
+    template <typename T>
+    bool addArrayFromAttribute(GLTFVertexAttribute::Value vertexAttribute, GLTFAccessor& accessor, QVector<T>& outarray);
 
     void retriangulate(const QVector<int>& in_indices, const QVector<glm::vec3>& in_vertices, 
                        const QVector<glm::vec3>& in_normals, QVector<int>& out_indices, 
                        QVector<glm::vec3>& out_vertices, QVector<glm::vec3>& out_normals);
 
-    std::tuple<bool, QByteArray> requestData(QUrl& url);
-    QNetworkReply* request(QUrl& url, bool isTest);
+    std::tuple<bool, hifi::ByteArray> requestData(hifi::URL& url);
+    hifi::ByteArray requestEmbeddedData(const QString& url);
+
+    QNetworkReply* request(hifi::URL& url, bool isTest);
     bool doesResourceExist(const QString& url);
 
 
-    void setHFMMaterial(HFMMaterial& fbxmat, const GLTFMaterial& material);
+    void setHFMMaterial(HFMMaterial& hfmMat, const GLTFMaterial& material);
     HFMTexture getHFMTexture(const GLTFTexture& texture);
+    void glTFDebugDump();
     void hfmDebugDump(const HFMModel& hfmModel);
 };
 

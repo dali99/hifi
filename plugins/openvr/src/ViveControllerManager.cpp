@@ -27,6 +27,7 @@
 #include <SettingHandle.h>
 #include <OffscreenUi.h>
 #include <GLMHelpers.h>
+#include <AvatarConstants.h>
 #include <glm/ext.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <ui-plugins/PluginContainer.h>
@@ -928,8 +929,8 @@ void ViveControllerManager::InputDevice::partitionTouchpad(int sButton, int xAxi
     const float CENTER_DEADBAND = 0.6f;
     const float DIAGONAL_DIVIDE_IN_RADIANS = PI / 4.0f;
     if (_buttonPressedMap.find(sButton) != _buttonPressedMap.end()) {
-        float absX = abs(_axisStateMap[xAxis]);
-        float absY = abs(_axisStateMap[yAxis]);
+        float absX = abs(_axisStateMap[xAxis].value);
+        float absY = abs(_axisStateMap[yAxis].value);
         glm::vec2 cartesianQuadrantI(absX, absY);
         float angle = glm::atan(cartesianQuadrantI.y / cartesianQuadrantI.x);
         float radius = glm::length(cartesianQuadrantI);
@@ -956,10 +957,10 @@ void ViveControllerManager::InputDevice::handleAxisEvent(float deltaTime, uint32
         } else {
             stick = _filteredRightStick.process(deltaTime, stick);
         }
-        _axisStateMap[isLeftHand ? LX : RX] = stick.x;
-        _axisStateMap[isLeftHand ? LY : RY] = stick.y;
+        _axisStateMap[isLeftHand ? LX : RX].value = stick.x;
+        _axisStateMap[isLeftHand ? LY : RY].value = stick.y;
     } else if (axis == vr::k_EButton_SteamVR_Trigger) {
-        _axisStateMap[isLeftHand ? LT : RT] = x;
+        _axisStateMap[isLeftHand ? LT : RT].value = x;
         // The click feeling on the Vive controller trigger represents a value of *precisely* 1.0,
         // so we can expose that as an additional button
         if (x >= 1.0f) {
@@ -1000,7 +1001,7 @@ void ViveControllerManager::InputDevice::handleButtonEvent(float deltaTime, uint
         if (button == vr::k_EButton_ApplicationMenu) {
             _buttonPressedMap.insert(isLeftHand ? LEFT_APP_MENU : RIGHT_APP_MENU);
         } else if (button == vr::k_EButton_Grip) {
-            _axisStateMap[isLeftHand ? LEFT_GRIP : RIGHT_GRIP] = 1.0f;
+            _axisStateMap[isLeftHand ? LEFT_GRIP : RIGHT_GRIP].value = 1.0f;
         } else if (button == vr::k_EButton_SteamVR_Trigger) {
             _buttonPressedMap.insert(isLeftHand ? LT : RT);
         } else if (button == vr::k_EButton_SteamVR_Touchpad) {
@@ -1008,7 +1009,7 @@ void ViveControllerManager::InputDevice::handleButtonEvent(float deltaTime, uint
         }
     } else {
         if (button == vr::k_EButton_Grip) {
-            _axisStateMap[isLeftHand ? LEFT_GRIP : RIGHT_GRIP] = 0.0f;
+            _axisStateMap[isLeftHand ? LEFT_GRIP : RIGHT_GRIP].value = 0.0f;
         }
     }
 
@@ -1024,7 +1025,16 @@ void ViveControllerManager::InputDevice::handleHeadPoseEvent(const controller::I
     //perform a 180 flip to make the HMD face the +z instead of -z, beacuse the head faces +z
     glm::mat4 matYFlip = mat * Matrices::Y_180;
     controller::Pose pose(extractTranslation(matYFlip), glmExtractRotation(matYFlip), linearVelocity, angularVelocity);
-    glm::mat4 defaultHeadOffset = glm::inverse(inputCalibrationData.defaultCenterEyeMat) * inputCalibrationData.defaultHeadMat;
+
+    glm::mat4 defaultHeadOffset;
+    if (inputCalibrationData.hmdAvatarAlignmentType == controller::HmdAvatarAlignmentType::Eyes) {
+        // align the eyes of the user with the eyes of the avatar
+        defaultHeadOffset = glm::inverse(inputCalibrationData.defaultCenterEyeMat) * inputCalibrationData.defaultHeadMat;
+    } else {
+        // align the head of the user with the head of the avatar
+        defaultHeadOffset = createMatFromQuatAndPos(Quaternions::IDENTITY, -DEFAULT_AVATAR_HEAD_TO_MIDDLE_EYE_OFFSET);
+    }
+
     glm::mat4 sensorToAvatar = glm::inverse(inputCalibrationData.avatarMat) * inputCalibrationData.sensorToWorldMat;
     _poseStateMap[controller::HEAD] = pose.postTransform(defaultHeadOffset).transform(sensorToAvatar);
 }
@@ -1289,27 +1299,33 @@ void ViveControllerManager::InputDevice::setConfigFromString(const QString& valu
 }
 
 /**jsdoc
- * <p>The <code>Controller.Hardware.Vive</code> object has properties representing Vive. The property values are integer IDs,
- * uniquely identifying each output. <em>Read-only.</em> These can be mapped to actions or functions or 
- * <code>Controller.Standard</code> items in a {@link RouteObject} mapping.</p>
+ * <p>The <code>Controller.Hardware.Vive</code> object has properties representing the Vive. The property values are integer 
+ * IDs, uniquely identifying each output. <em>Read-only.</em></p>
+ * <p>These outputs can be mapped to actions or functions or <code>Controller.Standard</code> items in a {@link RouteObject} 
+ * mapping.</p>
  * <table>
  *   <thead>
  *     <tr><th>Property</th><th>Type</th><th>Data</th><th>Description</th></tr>
  *   </thead>
  *   <tbody>
+ *     <tr><td colspan="4"><strong>Buttons</strong></td></tr>
+ *     <tr><td><code>LeftApplicationMenu</code></td><td>number</td><td>number</td><td>Left application menu button pressed.
+ *       </td></tr>
+ *     <tr><td><code>RightApplicationMenu</code></td><td>number</td><td>number</td><td>Right application menu button pressed.
+ *       </td></tr>
  *     <tr><td colspan="4"><strong>Touch Pad (Sticks)</strong></td></tr>
  *     <tr><td><code>LX</code></td><td>number</td><td>number</td><td>Left touch pad x-axis scale.</td></tr>
  *     <tr><td><code>LY</code></td><td>number</td><td>number</td><td>Left touch pad y-axis scale.</td></tr>
  *     <tr><td><code>RX</code></td><td>number</td><td>number</td><td>Right stick x-axis scale.</td></tr>
  *     <tr><td><code>RY</code></td><td>number</td><td>number</td><td>Right stick y-axis scale.</td></tr>
  *     <tr><td><code>LS</code></td><td>number</td><td>number</td><td>Left touch pad pressed.</td></tr>
- *     <tr><td><code>LS_CENTER</code></td><td>number</td><td>number</td><td>Left touch pad center pressed.</td></tr>
- *     <tr><td><code>LS_X</code></td><td>number</td><td>number</td><td>Left touch pad pressed x-coordinate.</td></tr>
- *     <tr><td><code>LS_Y</code></td><td>number</td><td>number</td><td>Left touch pad pressed y-coordinate.</td></tr>
+ *     <tr><td><code>LSCenter</code></td><td>number</td><td>number</td><td>Left touch pad center pressed.</td></tr>
+ *     <tr><td><code>LSX</code></td><td>number</td><td>number</td><td>Left touch pad pressed x-coordinate.</td></tr>
+ *     <tr><td><code>LSY</code></td><td>number</td><td>number</td><td>Left touch pad pressed y-coordinate.</td></tr>
  *     <tr><td><code>RS</code></td><td>number</td><td>number</td><td>Right touch pad pressed.</td></tr>
- *     <tr><td><code>RS_CENTER</code></td><td>number</td><td>number</td><td>Right touch pad center pressed.</td></tr>
- *     <tr><td><code>RS_X</code></td><td>number</td><td>number</td><td>Right touch pad pressed x-coordinate.</td></tr>
- *     <tr><td><code>RS_Y</code></td><td>number</td><td>number</td><td>Right touch pad pressed y-coordinate.</td></tr>
+ *     <tr><td><code>RSCenter</code></td><td>number</td><td>number</td><td>Right touch pad center pressed.</td></tr>
+ *     <tr><td><code>RSX</code></td><td>number</td><td>number</td><td>Right touch pad pressed x-coordinate.</td></tr>
+ *     <tr><td><code>RSY</code></td><td>number</td><td>number</td><td>Right touch pad pressed y-coordinate.</td></tr>
  *     <tr><td><code>LSTouch</code></td><td>number</td><td>number</td><td>Left touch pad is touched.</td></tr>
  *     <tr><td><code>RSTouch</code></td><td>number</td><td>number</td><td>Right touch pad is touched.</td></tr>
  *     <tr><td colspan="4"><strong>Triggers</strong></td></tr>

@@ -22,7 +22,9 @@
 #include <ui/TabletScriptingInterface.h>
 #include "scripting/HMDScriptingInterface.h"
 
-QmlCommerce::QmlCommerce() {
+QmlCommerce::QmlCommerce() :
+    _appsPath(PathUtils::getAppDataPath() + "Apps/")
+{
     auto ledger = DependencyManager::get<Ledger>();
     auto wallet = DependencyManager::get<Wallet>();
     connect(ledger.data(), &Ledger::buyResult, this, &QmlCommerce::buyResult);
@@ -44,23 +46,18 @@ QmlCommerce::QmlCommerce() {
 
     auto accountManager = DependencyManager::get<AccountManager>();
     connect(accountManager.data(), &AccountManager::usernameChanged, this, [&]() { setPassphrase(""); });
-
-    _appsPath = PathUtils::getAppDataPath() + "Apps/";
 }
 
 
-
-
 void QmlCommerce::openSystemApp(const QString& appName) {
-    static QMap<QString, QString> systemApps {
+    static const QMap<QString, QString> systemApps {
         {"GOTO",        "hifi/tablet/TabletAddressDialog.qml"},
         {"PEOPLE",      "hifi/Pal.qml"},
         {"WALLET",      "hifi/commerce/wallet/Wallet.qml"},
-        {"MARKET",      "/marketplace.html"}
+        {"MARKET",      "hifi/commerce/marketplace/Marketplace.qml"}
     };
 
-    static QMap<QString, QString> systemInject{
-        {"MARKET",      "/scripts/system/html/js/marketplacesInject.js"}
+    static const QMap<QString, QString> systemInject{
     };
 
 
@@ -262,7 +259,7 @@ void QmlCommerce::authorizeAssetTransfer(const QString& couponID,
     ledger->authorizeAssetTransfer(key, couponID, certificateID, amount, optionalMessage);
 }
 
-void QmlCommerce::replaceContentSet(const QString& itemHref, const QString& certificateID) {
+void QmlCommerce::replaceContentSet(const QString& itemHref, const QString& certificateID, const QString& itemName) {
     if (!certificateID.isEmpty()) {
         auto ledger = DependencyManager::get<Ledger>();
         ledger->updateLocation(
@@ -270,7 +267,7 @@ void QmlCommerce::replaceContentSet(const QString& itemHref, const QString& cert
             DependencyManager::get<AddressManager>()->getPlaceName(),
             true);
     }
-    qApp->replaceDomainContent(itemHref);
+    qApp->replaceDomainContent(itemHref, itemName);
     QJsonObject messageProperties = {
         { "status", "SuccessfulRequestToReplaceContent" },
         { "content_set_url", itemHref } };

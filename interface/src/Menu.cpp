@@ -29,14 +29,16 @@
 #include <VrMenu.h>
 #include <ScriptEngines.h>
 #include <MenuItemProperties.h>
+#include <ui/types/FileTypeProfile.h>
+#include <ui/types/HFWebEngineProfile.h>
 
 #include "Application.h"
 #include "AccountManager.h"
 #include "assets/ATPAssetMigrator.h"
 #include "audio/AudioScope.h"
 #include "avatar/AvatarManager.h"
+#include "avatar/AvatarPackager.h"
 #include "AvatarBookmarks.h"
-#include "devices/DdeFaceTracker.h"
 #include "MainWindow.h"
 #include "render/DrawStatus.h"
 #include "scripting/MenuScriptingInterface.h"
@@ -48,14 +50,13 @@
 #include "DeferredLightingEffect.h"
 #include "PickManager.h"
 
-#include "AmbientOcclusionEffect.h"
-#include "RenderShadowTask.h"
-#include "AntialiasingEffect.h"
-
 #include "scripting/SettingsScriptingInterface.h"
 #if defined(Q_OS_MAC) || defined(Q_OS_WIN)
 #include "SpeechRecognizer.h"
 #endif
+
+#include "MeshPartPayload.h"
+#include "scripting/RenderScriptingInterface.h"
 
 extern bool DEV_DECIMATE_TEXTURES;
 
@@ -114,7 +115,7 @@ Menu::Menu() {
     // Edit > Delete
     auto deleteAction = addActionToQMenuAndActionHash(editMenu, "Delete", QKeySequence::Delete);
     connect(deleteAction, &QAction::triggered, [] {
-            QKeyEvent* keyEvent = new QKeyEvent(QEvent::KeyPress, Qt::Key_Delete, Qt::ControlModifier);
+            QKeyEvent* keyEvent = new QKeyEvent(QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
             QCoreApplication::postEvent(QCoreApplication::instance(), keyEvent);
     });
 
@@ -143,9 +144,13 @@ Menu::Menu() {
         assetServerAction->setEnabled(nodeList->getThisNodeCanWriteAssets());
     }
 
-    // Edit > Package Avatar as .fst...
-    addActionToQMenuAndActionHash(editMenu, MenuOption::PackageModel, 0,
-        qApp, SLOT(packageModel()));
+    // Edit > Avatar Packager
+#ifndef Q_OS_ANDROID
+    action = addActionToQMenuAndActionHash(editMenu, MenuOption::AvatarPackager);
+    connect(action, &QAction::triggered, [] {
+        DependencyManager::get<AvatarPackager>()->open();
+    });
+#endif
 
     // Edit > Reload All Content
     addActionToQMenuAndActionHash(editMenu, MenuOption::ReloadContent, 0, qApp, SLOT(reloadResourceCaches()));
@@ -169,38 +174,24 @@ Menu::Menu() {
 
     // View > First Person
     auto firstPersonAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(
-                                   viewMenu, MenuOption::FirstPerson, 0,
+                                   viewMenu, MenuOption::FirstPersonLookAt, 0,
                                    true, qApp, SLOT(cameraMenuChanged())));
 
     firstPersonAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
 
-    // View > Third Person
-    auto thirdPersonAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(
-                                   viewMenu, MenuOption::ThirdPerson, 0,
+    // View > Look At
+    auto lookAtAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(
+                                   viewMenu, MenuOption::LookAtCamera, 0,
                                    false, qApp, SLOT(cameraMenuChanged())));
 
-    thirdPersonAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
+    lookAtAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
 
-    // View > Mirror
-    auto viewMirrorAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(
-                                   viewMenu, MenuOption::FullscreenMirror, 0,
-                                   false, qApp, SLOT(cameraMenuChanged())));
-
-    viewMirrorAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
-
-    // View > Independent
-    auto viewIndependentAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(viewMenu,
-        MenuOption::IndependentMode, 0,
+    // View > Selfie
+    auto selfieAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(
+        viewMenu, MenuOption::SelfieCamera, 0,
         false, qApp, SLOT(cameraMenuChanged())));
 
-    viewIndependentAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
-
-    // View > Entity Camera
-    auto viewEntityCameraAction = cameraModeGroup->addAction(addCheckableActionToQMenuAndActionHash(viewMenu,
-        MenuOption::CameraEntityMode, 0,
-        false, qApp, SLOT(cameraMenuChanged())));
-
-    viewEntityCameraAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
+    selfieAction->setProperty(EXCLUSION_GROUP_KEY, QVariant::fromValue(cameraModeGroup));
 
     viewMenu->addSeparator();
 
@@ -264,17 +255,26 @@ Menu::Menu() {
     // Settings > Audio...
     action = addActionToQMenuAndActionHash(settingsMenu, "Audio...");
     connect(action, &QAction::triggered, [] {
-        static const QUrl widgetUrl("hifi/dialogs/Audio.qml");
         static const QUrl tabletUrl("hifi/audio/Audio.qml");
-        static const QString name("AudioDialog");
-        qApp->showDialog(widgetUrl, tabletUrl, name);
+        auto tablet = DependencyManager::get<TabletScriptingInterface>()->getTablet("com.highfidelity.interface.tablet.system");
+        auto hmd = DependencyManager::get<HMDScriptingInterface>();
+        tablet->pushOntoStack(tabletUrl);
+
+        if (!hmd->getShouldShowTablet()) {
+            hmd->toggleShouldShowTablet();
+        }
     });
 
     // Settings > Graphics...
     action = addActionToQMenuAndActionHash(settingsMenu, "Graphics...");
     connect(action, &QAction::triggered, [] {
-        qApp->showDialog(QString("hifi/dialogs/GraphicsPreferencesDialog.qml"),
-            QString("hifi/tablet/TabletGraphicsPreferences.qml"), "GraphicsPreferencesDialog");
+        auto tablet = DependencyManager::get<TabletScriptingInterface>()->getTablet("com.highfidelity.interface.tablet.system");
+        auto hmd = DependencyManager::get<HMDScriptingInterface>();
+        tablet->pushOntoStack("hifi/dialogs/graphics/GraphicsSettings.qml");
+
+        if (!hmd->getShouldShowTablet()) {
+            hmd->toggleShouldShowTablet();
+        }
     });
 
     // Settings > Security...
@@ -371,53 +371,14 @@ Menu::Menu() {
     // Developer > Render >>>
     MenuWrapper* renderOptionsMenu = developerMenu->addMenu("Render");
 
-    action = addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::AntiAliasing, 0, true);
-    connect(action, &QAction::triggered, [action] {
-        auto renderConfig = qApp->getRenderEngine()->getConfiguration();
-        if (renderConfig) {
-            auto mainViewJitterCamConfig = renderConfig->getConfig<JitterSample>("RenderMainView.JitterCam");
-            auto mainViewAntialiasingConfig = renderConfig->getConfig<Antialiasing>("RenderMainView.Antialiasing");
-            if (mainViewJitterCamConfig && mainViewAntialiasingConfig) {
-                if (action->isChecked()) {
-                    mainViewJitterCamConfig->play();
-                    mainViewAntialiasingConfig->setDebugFXAA(false);
-                } else {
-                    mainViewJitterCamConfig->none();
-                    mainViewAntialiasingConfig->setDebugFXAA(true);
-                }
-            }
-        }
-    });
+    addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::AntiAliasing, 0, RenderScriptingInterface::getInstance()->getAntialiasingEnabled(),
+        RenderScriptingInterface::getInstance(), SLOT(setAntialiasingEnabled(bool)));
 
-    action = addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::Shadows, 0, true);
-    connect(action, &QAction::triggered, [action] {
-        auto renderConfig = qApp->getRenderEngine()->getConfiguration();
-        if (renderConfig) {
-            auto mainViewShadowTaskConfig = renderConfig->getConfig<RenderShadowTask>("RenderMainView.RenderShadowTask");
-            if (mainViewShadowTaskConfig) {
-                if (action->isChecked()) {
-                    mainViewShadowTaskConfig->setPreset("Enabled");
-                } else {
-                    mainViewShadowTaskConfig->setPreset("None");
-                }
-            }
-        }
-    });
+    addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::Shadows, 0, RenderScriptingInterface::getInstance()->getShadowsEnabled(),
+        RenderScriptingInterface::getInstance(), SLOT(setShadowsEnabled(bool)));
 
-    action = addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::AmbientOcclusion, 0, false);
-    connect(action, &QAction::triggered, [action] {
-        auto renderConfig = qApp->getRenderEngine()->getConfiguration();
-        if (renderConfig) {
-            auto mainViewAmbientOcclusionConfig = renderConfig->getConfig<AmbientOcclusionEffect>("RenderMainView.AmbientOcclusion");
-            if (mainViewAmbientOcclusionConfig) {
-                if (action->isChecked()) {
-                    mainViewAmbientOcclusionConfig->setPreset("Enabled");
-                } else {
-                    mainViewAmbientOcclusionConfig->setPreset("None");
-                }
-            }
-        }
-    });
+    addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::AmbientOcclusion, 0, RenderScriptingInterface::getInstance()->getAmbientOcclusionEnabled(),
+        RenderScriptingInterface::getInstance(), SLOT(setAmbientOcclusionEnabled(bool)));
 
     addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::WorldAxes);
     addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::DefaultSkybox, 0, true);
@@ -427,16 +388,6 @@ Menu::Menu() {
 
     // Developer > Render > OpenVR threaded submit
     addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::OpenVrThreadedSubmit, 0, true);
-
-    // Developer > Render > Resolution
-    MenuWrapper* resolutionMenu = renderOptionsMenu->addMenu(MenuOption::RenderResolution);
-    QActionGroup* resolutionGroup = new QActionGroup(resolutionMenu);
-    resolutionGroup->setExclusive(true);
-    resolutionGroup->addAction(addCheckableActionToQMenuAndActionHash(resolutionMenu, MenuOption::RenderResolutionOne, 0, true));
-    resolutionGroup->addAction(addCheckableActionToQMenuAndActionHash(resolutionMenu, MenuOption::RenderResolutionTwoThird, 0, false));
-    resolutionGroup->addAction(addCheckableActionToQMenuAndActionHash(resolutionMenu, MenuOption::RenderResolutionHalf, 0, false));
-    resolutionGroup->addAction(addCheckableActionToQMenuAndActionHash(resolutionMenu, MenuOption::RenderResolutionThird, 0, false));
-    resolutionGroup->addAction(addCheckableActionToQMenuAndActionHash(resolutionMenu, MenuOption::RenderResolutionQuarter, 0, false));
 
     //const QString  = "Automatic Texture Memory";
     //const QString  = "64 MB";
@@ -522,6 +473,17 @@ Menu::Menu() {
     addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::ComputeBlendshapes, 0, true,
         DependencyManager::get<ModelBlender>().data(), SLOT(setComputeBlendshapes(bool)));
 
+    action = addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::MaterialProceduralShaders, 0, false);
+    connect(action, &QAction::triggered, [action] {
+        MeshPartPayload::enableMaterialProceduralShaders = action->isChecked();
+    });
+
+    {
+        auto drawStatusConfig = qApp->getRenderEngine()->getConfiguration()->getConfig<render::DrawStatus>("RenderMainView.DrawStatus");
+        addCheckableActionToQMenuAndActionHash(renderOptionsMenu, MenuOption::HighlightTransitions, 0, false,
+            drawStatusConfig, SLOT(setShowFade(bool)));
+    }
+
     // Developer > Assets >>>
     // Menu item is not currently needed but code should be kept in case it proves useful again at some stage.
 //#define WANT_ASSET_MIGRATION
@@ -538,73 +500,18 @@ Menu::Menu() {
     // Developer > Avatar >>>
     MenuWrapper* avatarDebugMenu = developerMenu->addMenu("Avatar");
 
-    // Developer > Avatar > Face Tracking
-    MenuWrapper* faceTrackingMenu = avatarDebugMenu->addMenu("Face Tracking");
-    {
-        QActionGroup* faceTrackerGroup = new QActionGroup(avatarDebugMenu);
-
-        bool defaultNoFaceTracking = true;
-#ifdef HAVE_DDE
-        defaultNoFaceTracking = false;
-#endif
-        QAction* noFaceTracker = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::NoFaceTracking,
-            0, defaultNoFaceTracking,
-            qApp, SLOT(setActiveFaceTracker()));
-        faceTrackerGroup->addAction(noFaceTracker);
-
-#ifdef HAVE_DDE
-        QAction* ddeFaceTracker = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::UseCamera,
-            0, true,
-            qApp, SLOT(setActiveFaceTracker()));
-        faceTrackerGroup->addAction(ddeFaceTracker);
-#endif
-    }
-#ifdef HAVE_DDE
-    faceTrackingMenu->addSeparator();
-    QAction* binaryEyelidControl = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::BinaryEyelidControl, 0, true);
-    binaryEyelidControl->setVisible(true);  // DDE face tracking is on by default
-    QAction* coupleEyelids = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::CoupleEyelids, 0, true);
-    coupleEyelids->setVisible(true);  // DDE face tracking is on by default
-    QAction* useAudioForMouth = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::UseAudioForMouth, 0, true);
-    useAudioForMouth->setVisible(true);  // DDE face tracking is on by default
-    QAction* ddeFiltering = addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::VelocityFilter, 0, true);
-    ddeFiltering->setVisible(true);  // DDE face tracking is on by default
-    QAction* ddeCalibrate = addActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::CalibrateCamera, 0,
-        DependencyManager::get<DdeFaceTracker>().data(), SLOT(calibrate()));
-    ddeCalibrate->setVisible(true);  // DDE face tracking is on by default
-    faceTrackingMenu->addSeparator();
-    addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::MuteFaceTracking,
-        [](bool mute) { FaceTracker::setIsMuted(mute); },
-        Qt::CTRL | Qt::SHIFT | Qt::Key_F, FaceTracker::isMuted());
-    addCheckableActionToQMenuAndActionHash(faceTrackingMenu, MenuOption::AutoMuteAudio, 0, false);
-#endif
-
-#ifdef HAVE_IVIEWHMD
-    // Developer > Avatar > Eye Tracking
-    MenuWrapper* eyeTrackingMenu = avatarDebugMenu->addMenu("Eye Tracking");
-    addCheckableActionToQMenuAndActionHash(eyeTrackingMenu, MenuOption::SMIEyeTracking, 0, false,
-        qApp, SLOT(setActiveEyeTracker()));
-    {
-        MenuWrapper* calibrateEyeTrackingMenu = eyeTrackingMenu->addMenu("Calibrate");
-        addActionToQMenuAndActionHash(calibrateEyeTrackingMenu, MenuOption::OnePointCalibration, 0,
-            qApp, SLOT(calibrateEyeTracker1Point()));
-        addActionToQMenuAndActionHash(calibrateEyeTrackingMenu, MenuOption::ThreePointCalibration, 0,
-            qApp, SLOT(calibrateEyeTracker3Points()));
-        addActionToQMenuAndActionHash(calibrateEyeTrackingMenu, MenuOption::FivePointCalibration, 0,
-            qApp, SLOT(calibrateEyeTracker5Points()));
-    }
-    addCheckableActionToQMenuAndActionHash(eyeTrackingMenu, MenuOption::SimulateEyeTracking, 0, false,
-        qApp, SLOT(setActiveEyeTracker()));
-#endif
-
     action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::AvatarReceiveStats, 0, false);
     connect(action, &QAction::triggered, [this]{ Avatar::setShowReceiveStats(isOptionChecked(MenuOption::AvatarReceiveStats)); });
     action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowBoundingCollisionShapes, 0, false);
     connect(action, &QAction::triggered, [this]{ Avatar::setShowCollisionShapes(isOptionChecked(MenuOption::ShowBoundingCollisionShapes)); });
     action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowMyLookAtVectors, 0, false);
     connect(action, &QAction::triggered, [this]{ Avatar::setShowMyLookAtVectors(isOptionChecked(MenuOption::ShowMyLookAtVectors)); });
+    action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowMyLookAtTarget, 0, false);
+    connect(action, &QAction::triggered, [this]{ Avatar::setShowMyLookAtTarget(isOptionChecked(MenuOption::ShowMyLookAtTarget)); });
     action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowOtherLookAtVectors, 0, false);
     connect(action, &QAction::triggered, [this]{ Avatar::setShowOtherLookAtVectors(isOptionChecked(MenuOption::ShowOtherLookAtVectors)); });
+    action = addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowOtherLookAtTarget, 0, false);
+    connect(action, &QAction::triggered, [this]{ Avatar::setShowOtherLookAtTarget(isOptionChecked(MenuOption::ShowOtherLookAtTarget)); });
 
     auto avatarManager = DependencyManager::get<AvatarManager>();
     auto avatar = avatarManager->getMyAvatar();
@@ -625,6 +532,8 @@ Menu::Menu() {
         avatar.get(), SLOT(setEnableDebugDrawAnimPose(bool)));
     addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::AnimDebugDrawPosition, 0, false,
         avatar.get(), SLOT(setEnableDebugDrawPosition(bool)));
+    addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::AnimDebugDrawOtherSkeletons, 0, false,
+        avatarManager.data(), SLOT(setEnableDebugDrawOtherSkeletons(bool)));
     addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::MeshVisible, 0, true,
         avatar.get(), SLOT(setEnableMeshVisible(bool)));
     addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::DisableEyelidAdjustment, 0, false);
@@ -652,6 +561,8 @@ Menu::Menu() {
 
     addCheckableActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::ShowTrackedObjects, 0, false, qApp, SLOT(setShowTrackedObjects(bool)));
 
+    addActionToQMenuAndActionHash(avatarDebugMenu, MenuOption::PackageModel, 0, qApp, SLOT(packageModel()));
+
     // Developer > Hands >>>
     MenuWrapper* handOptionsMenu = developerMenu->addMenu("Hands");
     addCheckableActionToQMenuAndActionHash(handOptionsMenu, MenuOption::DisplayHandTargets, 0, false,
@@ -673,8 +584,20 @@ Menu::Menu() {
             QString("hifi/tablet/TabletNetworkingPreferences.qml"), "NetworkingPreferencesDialog");
     });
     addActionToQMenuAndActionHash(networkMenu, MenuOption::ReloadContent, 0, qApp, SLOT(reloadResourceCaches()));
-    addActionToQMenuAndActionHash(networkMenu, MenuOption::ClearDiskCache, 0,
-        DependencyManager::get<AssetClient>().data(), SLOT(clearCache()));
+
+	action = addActionToQMenuAndActionHash(networkMenu, MenuOption::ClearDiskCaches);
+    connect(action, &QAction::triggered, [] {
+        // The following caches are cleared immediately
+        DependencyManager::get<AssetClient>()->clearCache();
+#ifndef Q_OS_ANDROID
+        FileTypeProfile::clearCache();
+        HFWebEngineProfile::clearCache();
+#endif
+
+        // Clear the KTX cache on the next restart. It can't be cleared immediately because its files might be in use.
+        Setting::Handle<int>(KTXCache::SETTING_VERSION_NAME, KTXCache::INVALID_VERSION).set(KTXCache::INVALID_VERSION);
+    });
+
     addCheckableActionToQMenuAndActionHash(networkMenu,
         MenuOption::DisableActivityLogger,
         0,
@@ -695,16 +618,10 @@ Menu::Menu() {
     }
     #endif
 
-
-    // Developer >> Tests >>>
-    MenuWrapper* testMenu = developerMenu->addMenu("Tests");
-    addActionToQMenuAndActionHash(testMenu, MenuOption::RunClientScriptTests, 0, dialogsManager.data(), SLOT(showTestingResults()));
-
     // Developer > Timing >>>
     MenuWrapper* timingMenu = developerMenu->addMenu("Timing");
     MenuWrapper* perfTimerMenu = timingMenu->addMenu("Performance Timer");
-    addCheckableActionToQMenuAndActionHash(perfTimerMenu, MenuOption::DisplayDebugTimingDetails, 0, false,
-            qApp, SLOT(enablePerfStats(bool)));
+    addCheckableActionToQMenuAndActionHash(perfTimerMenu, MenuOption::DisplayDebugTimingDetails);
     addCheckableActionToQMenuAndActionHash(perfTimerMenu, MenuOption::OnlyDisplayTopTen, 0, true);
     addCheckableActionToQMenuAndActionHash(perfTimerMenu, MenuOption::ExpandUpdateTiming, 0, false);
     addCheckableActionToQMenuAndActionHash(perfTimerMenu, MenuOption::ExpandSimulationTiming, 0, false);
@@ -767,43 +684,51 @@ Menu::Menu() {
         DependencyManager::get<PickManager>().data(), SLOT(setForceCoarsePicking(bool)));
 
     // Developer > Crash >>>
-    MenuWrapper* crashMenu = developerMenu->addMenu("Crash");
+    bool result = false;
+    const QString HIFI_SHOW_DEVELOPER_CRASH_MENU("HIFI_SHOW_DEVELOPER_CRASH_MENU");
+    result = QProcessEnvironment::systemEnvironment().contains(HIFI_SHOW_DEVELOPER_CRASH_MENU);
+    if (result) {
+        MenuWrapper* crashMenu = developerMenu->addMenu("Crash");
     
-    // Developer > Crash > Display Crash Options
-    addCheckableActionToQMenuAndActionHash(crashMenu, MenuOption::DisplayCrashOptions, 0, true);
+        // Developer > Crash > Display Crash Options
+        addCheckableActionToQMenuAndActionHash(crashMenu, MenuOption::DisplayCrashOptions, 0, true);
 
-    addActionToQMenuAndActionHash(crashMenu, MenuOption::DeadlockInterface, 0, qApp, SLOT(deadlockApplication()));
-    addActionToQMenuAndActionHash(crashMenu, MenuOption::UnresponsiveInterface, 0, qApp, SLOT(unresponsiveApplication()));
+        addActionToQMenuAndActionHash(crashMenu, MenuOption::DeadlockInterface, 0, qApp, SLOT(deadlockApplication()));
+        addActionToQMenuAndActionHash(crashMenu, MenuOption::UnresponsiveInterface, 0, qApp, SLOT(unresponsiveApplication()));
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashPureVirtualFunction);
-    connect(action, &QAction::triggered, qApp, []() { crash::pureVirtualCall(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashPureVirtualFunctionThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::pureVirtualCall).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashPureVirtualFunction);
+        connect(action, &QAction::triggered, qApp, []() { crash::pureVirtualCall(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashPureVirtualFunctionThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::pureVirtualCall).join(); });
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashDoubleFree);
-    connect(action, &QAction::triggered, qApp, []() { crash::doubleFree(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashDoubleFreeThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::doubleFree).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashDoubleFree);
+        connect(action, &QAction::triggered, qApp, []() { crash::doubleFree(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashDoubleFreeThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::doubleFree).join(); });
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashAbort);
-    connect(action, &QAction::triggered, qApp, []() { crash::doAbort(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashAbortThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::doAbort).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashAbort);
+        connect(action, &QAction::triggered, qApp, []() { crash::doAbort(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashAbortThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::doAbort).join(); });
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNullDereference);
-    connect(action, &QAction::triggered, qApp, []() { crash::nullDeref(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNullDereferenceThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::nullDeref).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNullDereference);
+        connect(action, &QAction::triggered, qApp, []() { crash::nullDeref(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNullDereferenceThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::nullDeref).join(); });
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashOutOfBoundsVectorAccess);
-    connect(action, &QAction::triggered, qApp, []() { crash::outOfBoundsVectorCrash(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashOutOfBoundsVectorAccessThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::outOfBoundsVectorCrash).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashOutOfBoundsVectorAccess);
+        connect(action, &QAction::triggered, qApp, []() { crash::outOfBoundsVectorCrash(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashOutOfBoundsVectorAccessThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::outOfBoundsVectorCrash).join(); });
 
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNewFault);
-    connect(action, &QAction::triggered, qApp, []() { crash::newFault(); });
-    action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNewFaultThreaded);
-    connect(action, &QAction::triggered, qApp, []() { std::thread(crash::newFault).join(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNewFault);
+        connect(action, &QAction::triggered, qApp, []() { crash::newFault(); });
+        action = addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashNewFaultThreaded);
+        connect(action, &QAction::triggered, qApp, []() { std::thread(crash::newFault).join(); });
+
+        addActionToQMenuAndActionHash(crashMenu, MenuOption::CrashOnShutdown, 0, qApp, SLOT(crashOnShutdown()));
+    }
+    
 
     // Developer > Show Statistics
     addCheckableActionToQMenuAndActionHash(developerMenu, MenuOption::Stats, 0, true);
@@ -877,7 +802,7 @@ Menu::Menu() {
     // Help > Release Notes
     action = addActionToQMenuAndActionHash(helpMenu, "Release Notes");
     connect(action, &QAction::triggered, qApp, [] {
-        QDesktopServices::openUrl(QUrl("http://steamcommunity.com/games/390540/announcements/"));
+        QDesktopServices::openUrl(QUrl("https://docs.highfidelity.com/release-notes.html"));
     });
 
     // Help > Report a Bug!

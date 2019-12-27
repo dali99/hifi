@@ -67,108 +67,6 @@ bool HFMMaterial::needTangentSpace() const {
     return !normalTexture.isNull();
 }
 
-static void _createBlendShapeTangents(HFMMesh& mesh, bool generateFromTexCoords, HFMBlendshape& blendShape);
-
-void HFMMesh::createBlendShapeTangents(bool generateTangents) {
-    for (auto& blendShape : blendshapes) {
-        _createBlendShapeTangents(*this, generateTangents, blendShape);
-    }
-}
-
-using IndexAccessor = std::function<glm::vec3*(const HFMMesh&, int, int, glm::vec3*, glm::vec3&)>;
-
-static void setTangents(const HFMMesh& mesh, const IndexAccessor& vertexAccessor, int firstIndex, int secondIndex,
-    const QVector<glm::vec3>& vertices, const QVector<glm::vec3>& normals, QVector<glm::vec3>& tangents) {
-    glm::vec3 vertex[2];
-    glm::vec3 normal;
-    glm::vec3* tangent = vertexAccessor(mesh, firstIndex, secondIndex, vertex, normal);
-    if (tangent) {
-        glm::vec3 bitangent = glm::cross(normal, vertex[1] - vertex[0]);
-        if (glm::length(bitangent) < EPSILON) {
-            return;
-        }
-        glm::vec2 texCoordDelta = mesh.texCoords.at(secondIndex) - mesh.texCoords.at(firstIndex);
-        glm::vec3 normalizedNormal = glm::normalize(normal);
-        *tangent += glm::cross(glm::angleAxis(-atan2f(-texCoordDelta.t, texCoordDelta.s), normalizedNormal) *
-            glm::normalize(bitangent), normalizedNormal);
-    }
-}
-
-static void createTangents(const HFMMesh& mesh, bool generateFromTexCoords,
-    const QVector<glm::vec3>& vertices, const QVector<glm::vec3>& normals, QVector<glm::vec3>& tangents,
-    IndexAccessor accessor) {
-    // if we have a normal map (and texture coordinates), we must compute tangents
-    if (generateFromTexCoords && !mesh.texCoords.isEmpty()) {
-        tangents.resize(vertices.size());
-
-        foreach(const HFMMeshPart& part, mesh.parts) {
-            for (int i = 0; i < part.quadIndices.size(); i += 4) {
-                setTangents(mesh, accessor, part.quadIndices.at(i), part.quadIndices.at(i + 1), vertices, normals, tangents);
-                setTangents(mesh, accessor, part.quadIndices.at(i + 1), part.quadIndices.at(i + 2), vertices, normals, tangents);
-                setTangents(mesh, accessor, part.quadIndices.at(i + 2), part.quadIndices.at(i + 3), vertices, normals, tangents);
-                setTangents(mesh, accessor, part.quadIndices.at(i + 3), part.quadIndices.at(i), vertices, normals, tangents);
-            }
-            // <= size - 3 in order to prevent overflowing triangleIndices when (i % 3) != 0
-            // This is most likely evidence of a further problem in extractMesh()
-            for (int i = 0; i <= part.triangleIndices.size() - 3; i += 3) {
-                setTangents(mesh, accessor, part.triangleIndices.at(i), part.triangleIndices.at(i + 1), vertices, normals, tangents);
-                setTangents(mesh, accessor, part.triangleIndices.at(i + 1), part.triangleIndices.at(i + 2), vertices, normals, tangents);
-                setTangents(mesh, accessor, part.triangleIndices.at(i + 2), part.triangleIndices.at(i), vertices, normals, tangents);
-            }
-            if ((part.triangleIndices.size() % 3) != 0) {
-                qCDebug(modelformat) << "Error in extractHFMModel part.triangleIndices.size() is not divisible by three ";
-            }
-        }
-    }
-}
-
-void HFMMesh::createMeshTangents(bool generateFromTexCoords) {
-    HFMMesh& mesh = *this;
-    // This is the only workaround I've found to trick the compiler into understanding that mesh.tangents isn't
-    // const in the lambda function.
-    auto& tangents = mesh.tangents;
-    createTangents(mesh, generateFromTexCoords, mesh.vertices, mesh.normals, mesh.tangents, 
-        [&](const HFMMesh& mesh, int firstIndex, int secondIndex, glm::vec3* outVertices, glm::vec3& outNormal) {
-        outVertices[0] = mesh.vertices[firstIndex];
-        outVertices[1] = mesh.vertices[secondIndex];
-        outNormal = mesh.normals[firstIndex];
-        return &(tangents[firstIndex]);
-    });
-}
-
-static void _createBlendShapeTangents(HFMMesh& mesh, bool generateFromTexCoords, HFMBlendshape& blendShape) {
-    // Create lookup to get index in blend shape from vertex index in mesh
-    std::vector<int> reverseIndices;
-    reverseIndices.resize(mesh.vertices.size());
-    std::iota(reverseIndices.begin(), reverseIndices.end(), 0);
-
-    for (int indexInBlendShape = 0; indexInBlendShape < blendShape.indices.size(); ++indexInBlendShape) {
-        auto indexInMesh = blendShape.indices[indexInBlendShape];
-        reverseIndices[indexInMesh] = indexInBlendShape;
-    }
-
-    createTangents(mesh, generateFromTexCoords, blendShape.vertices, blendShape.normals, blendShape.tangents,
-        [&](const HFMMesh& mesh, int firstIndex, int secondIndex, glm::vec3* outVertices, glm::vec3& outNormal) {
-        const auto index1 = reverseIndices[firstIndex];
-        const auto index2 = reverseIndices[secondIndex];
-
-        if (index1 < blendShape.vertices.size()) {
-            outVertices[0] = blendShape.vertices[index1];
-            if (index2 < blendShape.vertices.size()) {
-                outVertices[1] = blendShape.vertices[index2];
-            } else {
-                // Index isn't in the blend shape so return vertex from mesh
-                outVertices[1] = mesh.vertices[secondIndex];
-            }
-            outNormal = blendShape.normals[index1];
-            return &blendShape.tangents[index1];
-        } else {
-            // Index isn't in blend shape so return nullptr
-            return (glm::vec3*)nullptr;
-        }
-    });
-}
-
 QStringList HFMModel::getJointNames() const {
     QStringList names;
     foreach (const HFMJoint& joint, joints) {
@@ -178,7 +76,7 @@ QStringList HFMModel::getJointNames() const {
 }
 
 bool HFMModel::hasBlendedMeshes() const {
-    if (!meshes.isEmpty()) {
+    if (!meshes.empty()) {
         foreach (const HFMMesh& mesh, meshes) {
             if (!mesh.blendshapes.isEmpty()) {
                 return true;
@@ -189,25 +87,24 @@ bool HFMModel::hasBlendedMeshes() const {
 }
 
 Extents HFMModel::getUnscaledMeshExtents() const {
-    const Extents& extents = meshExtents;
-
     // even though our caller asked for "unscaled" we need to include any fst scaling, translation, and rotation, which
     // is captured in the offset matrix
-    glm::vec3 minimum = glm::vec3(offset * glm::vec4(extents.minimum, 1.0f));
-    glm::vec3 maximum = glm::vec3(offset * glm::vec4(extents.maximum, 1.0f));
+    glm::vec3 minimum = glm::vec3(offset * glm::vec4(meshExtents.minimum, 1.0f));
+    glm::vec3 maximum = glm::vec3(offset * glm::vec4(meshExtents.maximum, 1.0f));
     Extents scaledExtents = { minimum, maximum };
-
     return scaledExtents;
 }
 
 // TODO: Move to graphics::Mesh when Sam's ready
 bool HFMModel::convexHullContains(const glm::vec3& point) const {
-    if (!getUnscaledMeshExtents().containsPoint(point)) {
+    if (!meshExtents.containsPoint(point)) {
         return false;
     }
 
     auto checkEachPrimitive = [=](HFMMesh& mesh, QVector<int> indices, int primitiveSize) -> bool {
         // Check whether the point is "behind" all the primitives.
+        // But first must transform from model-frame into mesh-frame
+        glm::vec3 transformedPoint = glm::vec3(glm::inverse(mesh.modelTransform) * glm::vec4(point, 1.0f));
         int verticesSize = mesh.vertices.size();
         for (int j = 0;
             j < indices.size() - 2; // -2 in case the vertices aren't the right size -- we access j + 2 below
@@ -215,7 +112,7 @@ bool HFMModel::convexHullContains(const glm::vec3& point) const {
             if (indices[j] < verticesSize &&
                 indices[j + 1] < verticesSize &&
                 indices[j + 2] < verticesSize &&
-                !isPointBehindTrianglesPlane(point,
+                !isPointBehindTrianglesPlane(transformedPoint,
                     mesh.vertices[indices[j]],
                     mesh.vertices[indices[j + 1]],
                     mesh.vertices[indices[j + 2]])) {
@@ -256,4 +153,219 @@ QString HFMModel::getModelNameOfMesh(int meshIndex) const {
         return meshIndicesToModelNames.value(meshIndex);
     }
     return QString();
+}
+
+void HFMModel::computeKdops() {
+    const float INV_SQRT_3 = 0.57735026918f;
+    ShapeVertices cardinalDirections = {
+        Vectors::UNIT_X,
+        Vectors::UNIT_Y,
+        Vectors::UNIT_Z,
+        glm::vec3(INV_SQRT_3,  INV_SQRT_3,  INV_SQRT_3),
+        glm::vec3(INV_SQRT_3, -INV_SQRT_3,  INV_SQRT_3),
+        glm::vec3(INV_SQRT_3,  INV_SQRT_3, -INV_SQRT_3),
+        glm::vec3(INV_SQRT_3, -INV_SQRT_3, -INV_SQRT_3)
+    };
+    if (joints.size() != shapeVertices.size()) {
+        return;
+    }
+    // now that all joints have been scanned compute a k-Dop bounding volume of mesh
+    for (size_t i = 0; i < joints.size(); ++i) {
+        HFMJoint& joint = joints[i];
+
+        // NOTE: points are in joint-frame
+        ShapeVertices& points = shapeVertices.at(i);
+        glm::quat rotOffset = jointRotationOffsets.contains((int)i) ? glm::inverse(jointRotationOffsets[(int)i]) : quat();
+        if (points.size() > 0) {
+            // compute average point
+            glm::vec3 avgPoint = glm::vec3(0.0f);
+            for (uint32_t j = 0; j < points.size(); ++j) {
+                points[j] = rotOffset * points[j];
+                avgPoint += points[j];
+            }
+            avgPoint /= (float)points.size();
+            joint.shapeInfo.avgPoint = avgPoint;
+
+            // compute a k-Dop bounding volume
+            for (uint32_t j = 0; j < cardinalDirections.size(); ++j) {
+                float maxDot = -FLT_MAX;
+                float minDot = FLT_MIN;
+                for (uint32_t k = 0; k < points.size(); ++k) {
+                    float kDot = glm::dot(cardinalDirections[j], points[k] - avgPoint);
+                    if (kDot > maxDot) {
+                        maxDot = kDot;
+                    }
+                    if (kDot < minDot) {
+                        minDot = kDot;
+                    }
+                }
+                joint.shapeInfo.points.push_back(avgPoint + maxDot * cardinalDirections[j]);
+                joint.shapeInfo.dots.push_back(maxDot);
+                joint.shapeInfo.points.push_back(avgPoint + minDot * cardinalDirections[j]);
+                joint.shapeInfo.dots.push_back(-minDot);
+            }
+            generateBoundryLinesForDop14(joint.shapeInfo.dots, joint.shapeInfo.avgPoint, joint.shapeInfo.debugLines);
+        }
+    }
+}
+
+void hfm::Model::debugDump() const {
+    qCDebug(modelformat) << "---------------- hfmModel ----------------";
+    qCDebug(modelformat) << "  hasSkeletonJoints =" << hasSkeletonJoints;
+    qCDebug(modelformat) << "  offset =" << offset;
+
+    qCDebug(modelformat) << "  neckPivot = " << neckPivot;
+
+    qCDebug(modelformat) << "  bindExtents.size() = " << bindExtents.size();
+    qCDebug(modelformat) << "  meshExtents.size() = " << meshExtents.size();
+
+    qCDebug(modelformat) << "---------------- Shapes ----------------";
+    qCDebug(modelformat) << "  shapes.size() =" << shapes.size();
+    for (const hfm::Shape& shape : shapes) {
+        qCDebug(modelformat) << "\n";
+        qCDebug(modelformat) << "    mesh =" << shape.mesh;
+        qCDebug(modelformat) << "    meshPart =" << shape.meshPart;
+        qCDebug(modelformat) << "    material =" << shape.material;
+        qCDebug(modelformat) << "    joint =" << shape.joint;
+        qCDebug(modelformat) << "    transformedExtents =" << shape.transformedExtents;
+        qCDebug(modelformat) << "    skinDeformer =" << shape.skinDeformer;
+    }
+
+    qCDebug(modelformat) << "  jointIndices.size() =" << jointIndices.size();
+    qCDebug(modelformat) << "  joints.size() =" << joints.size();
+    qCDebug(modelformat) << "---------------- Meshes ----------------";
+    qCDebug(modelformat) << "  meshes.size() =" << meshes.size();
+    qCDebug(modelformat) << "  blendshapeChannelNames = " << blendshapeChannelNames;
+    for (const HFMMesh& mesh : meshes) {
+        qCDebug(modelformat) << "\n";
+        qCDebug(modelformat) << "    meshpointer =" << mesh._mesh.get();
+        qCDebug(modelformat) << "    meshindex =" << mesh.meshIndex;
+        qCDebug(modelformat) << "    vertices.size() =" << mesh.vertices.size();
+        qCDebug(modelformat) << "    colors.size() =" << mesh.colors.size();
+        qCDebug(modelformat) << "    normals.size() =" << mesh.normals.size();
+        qCDebug(modelformat) << "    tangents.size() =" << mesh.tangents.size();
+        qCDebug(modelformat) << "    colors.size() =" << mesh.colors.size();
+        qCDebug(modelformat) << "    texCoords.size() =" << mesh.texCoords.size();
+        qCDebug(modelformat) << "    texCoords1.size() =" << mesh.texCoords1.size();
+        qCDebug(modelformat) << "    clusterIndices.size() =" << mesh.clusterIndices.size();
+        qCDebug(modelformat) << "    clusterWeights.size() =" << mesh.clusterWeights.size();
+        qCDebug(modelformat) << "    modelTransform =" << mesh.modelTransform;
+        qCDebug(modelformat) << "    parts.size() =" << mesh.parts.size();
+        qCDebug(modelformat) << "---------------- Meshes (blendshapes)--------";
+        for (HFMBlendshape bshape : mesh.blendshapes) {
+            qCDebug(modelformat) << "\n";
+            qCDebug(modelformat) << "    bshape.indices.size() =" << bshape.indices.size();
+            qCDebug(modelformat) << "    bshape.vertices.size() =" << bshape.vertices.size();
+            qCDebug(modelformat) << "    bshape.normals.size() =" << bshape.normals.size();
+            qCDebug(modelformat) << "\n";
+        }
+        qCDebug(modelformat) << "---------------- Meshes (meshparts)--------";
+        for (HFMMeshPart meshPart : mesh.parts) {
+            qCDebug(modelformat) << "\n";
+            qCDebug(modelformat) << "        quadIndices.size() =" << meshPart.quadIndices.size();
+            qCDebug(modelformat) << "        triangleIndices.size() =" << meshPart.triangleIndices.size();
+            qCDebug(modelformat) << "\n";
+        }
+    }
+    qCDebug(modelformat) << "---------------- AnimationFrames ----------------";
+    for (HFMAnimationFrame anim : animationFrames) {
+        qCDebug(modelformat) << "  anim.translations = " << anim.translations;
+        qCDebug(modelformat) << "  anim.rotations = " << anim.rotations;
+    }
+    QList<int> mitomona_keys = meshIndicesToModelNames.keys();
+    for (int key : mitomona_keys) {
+        qCDebug(modelformat) << "    meshIndicesToModelNames key =" << key
+            << "  val =" << meshIndicesToModelNames[key];
+    }
+
+    qCDebug(modelformat) << "---------------- Materials ----------------";
+
+    for (HFMMaterial mat : materials) {
+        qCDebug(modelformat) << "\n";
+        qCDebug(modelformat) << "  mat.materialID =" << mat.materialID;
+        qCDebug(modelformat) << "  diffuseColor =" << mat.diffuseColor;
+        qCDebug(modelformat) << "  diffuseFactor =" << mat.diffuseFactor;
+        qCDebug(modelformat) << "  specularColor =" << mat.specularColor;
+        qCDebug(modelformat) << "  specularFactor =" << mat.specularFactor;
+        qCDebug(modelformat) << "  emissiveColor =" << mat.emissiveColor;
+        qCDebug(modelformat) << "  emissiveFactor =" << mat.emissiveFactor;
+        qCDebug(modelformat) << "  shininess =" << mat.shininess;
+        qCDebug(modelformat) << "  opacity =" << mat.opacity;
+        qCDebug(modelformat) << "  metallic =" << mat.metallic;
+        qCDebug(modelformat) << "  roughness =" << mat.roughness;
+        qCDebug(modelformat) << "  emissiveIntensity =" << mat.emissiveIntensity;
+        qCDebug(modelformat) << "  ambientFactor =" << mat.ambientFactor;
+
+        qCDebug(modelformat) << "  materialID =" << mat.materialID;
+        qCDebug(modelformat) << "  name =" << mat.name;
+        qCDebug(modelformat) << "  shadingModel =" << mat.shadingModel;
+        qCDebug(modelformat) << "  _material =" << mat._material.get();
+
+        qCDebug(modelformat) << "  normalTexture =" << mat.normalTexture.filename;
+        qCDebug(modelformat) << "  albedoTexture =" << mat.albedoTexture.filename;
+        qCDebug(modelformat) << "  opacityTexture =" << mat.opacityTexture.filename;
+
+        qCDebug(modelformat) << "  lightmapParams =" << mat.lightmapParams;
+
+        qCDebug(modelformat) << "  isPBSMaterial =" << mat.isPBSMaterial;
+        qCDebug(modelformat) << "  useNormalMap =" << mat.useNormalMap;
+        qCDebug(modelformat) << "  useAlbedoMap =" << mat.useAlbedoMap;
+        qCDebug(modelformat) << "  useOpacityMap =" << mat.useOpacityMap;
+        qCDebug(modelformat) << "  useRoughnessMap =" << mat.useRoughnessMap;
+        qCDebug(modelformat) << "  useSpecularMap =" << mat.useSpecularMap;
+        qCDebug(modelformat) << "  useMetallicMap =" << mat.useMetallicMap;
+        qCDebug(modelformat) << "  useEmissiveMap =" << mat.useEmissiveMap;
+        qCDebug(modelformat) << "  useOcclusionMap =" << mat.useOcclusionMap;
+        qCDebug(modelformat) << "\n";
+    }
+
+    qCDebug(modelformat) << "---------------- Joints ----------------";
+
+    for (const HFMJoint& joint : joints) {
+        qCDebug(modelformat) << "\n";
+        qCDebug(modelformat) << "    shapeInfo.avgPoint =" << joint.shapeInfo.avgPoint;
+        qCDebug(modelformat) << "    shapeInfo.debugLines =" << joint.shapeInfo.debugLines;
+        qCDebug(modelformat) << "    shapeInfo.dots =" << joint.shapeInfo.dots;
+        qCDebug(modelformat) << "    shapeInfo.points =" << joint.shapeInfo.points;
+
+        qCDebug(modelformat) << "    ---";
+
+        qCDebug(modelformat) << "    parentIndex" << joint.parentIndex;
+        qCDebug(modelformat) << "    distanceToParent" << joint.distanceToParent;
+        qCDebug(modelformat) << "    localTransform" << joint.localTransform;
+        qCDebug(modelformat) << "    transform" << joint.transform;
+        qCDebug(modelformat) << "    globalTransform" << joint.globalTransform;
+
+        qCDebug(modelformat) << "    ---";
+
+        qCDebug(modelformat) << "    translation" << joint.translation;
+        qCDebug(modelformat) << "    preTransform" << joint.preTransform;
+        qCDebug(modelformat) << "    preRotation" << joint.preRotation;
+        qCDebug(modelformat) << "    rotation" << joint.rotation;
+        qCDebug(modelformat) << "    postRotation" << joint.postRotation;
+        qCDebug(modelformat) << "    postTransform" << joint.postTransform;
+        qCDebug(modelformat) << "    rotationMin" << joint.rotationMin;
+        qCDebug(modelformat) << "    rotationMax" << joint.rotationMax;
+        qCDebug(modelformat) << "    inverseDefaultRotation" << joint.inverseDefaultRotation;
+        qCDebug(modelformat) << "    inverseBindRotation" << joint.inverseBindRotation;
+        qCDebug(modelformat) << "    bindTransformFoundInCluster" << joint.bindTransformFoundInCluster;
+        qCDebug(modelformat) << "    bindTransform" << joint.bindTransform;
+        qCDebug(modelformat) << "    name" << joint.name;
+        qCDebug(modelformat) << "    isSkeletonJoint" << joint.isSkeletonJoint;
+        qCDebug(modelformat) << "    geometricOffset" << joint.geometricOffset;
+        qCDebug(modelformat) << "\n";
+    }
+
+    qCDebug(modelformat) << "------------- SkinDeformers ------------";
+    qCDebug(modelformat) << "    skinDeformers.size() =" << skinDeformers.size();
+    for(const hfm::SkinDeformer& skinDeformer : skinDeformers) {
+        qCDebug(modelformat) << "------- SkinDeformers (Clusters) -------";
+        for (const hfm::Cluster& cluster : skinDeformer.clusters) {
+            qCDebug(modelformat) << "\n";
+            qCDebug(modelformat) << "        jointIndex =" << cluster.jointIndex;
+            qCDebug(modelformat) << "        inverseBindMatrix =" << cluster.inverseBindMatrix;
+            qCDebug(modelformat) << "\n";
+        }
+    }
+    qCDebug(modelformat) << "\n";
 }

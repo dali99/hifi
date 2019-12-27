@@ -57,7 +57,7 @@ public:
         ICEServerQuery,
         OctreeStats,
         SetAvatarTraits,
-        AvatarIdentityRequest,
+        InjectorGainSet,
         AssignmentClientStatus,
         NoisyMute,
         AvatarIdentity,
@@ -133,7 +133,9 @@ public:
         EntityQueryInitialResultsComplete,
         BulkAvatarTraits,
         AudioSoloRequest,
-
+        BulkAvatarTraitsAck,
+        StopInjector,
+        AvatarZonePresence,
         NUM_PACKET_TYPE
     };
 
@@ -184,7 +186,8 @@ public:
             << PacketTypeEnum::Value::OctreeFileReplacement << PacketTypeEnum::Value::ReplicatedMicrophoneAudioNoEcho
             << PacketTypeEnum::Value::ReplicatedMicrophoneAudioWithEcho << PacketTypeEnum::Value::ReplicatedInjectAudio
             << PacketTypeEnum::Value::ReplicatedSilentAudioFrame << PacketTypeEnum::Value::ReplicatedAvatarIdentity
-            << PacketTypeEnum::Value::ReplicatedKillAvatar << PacketTypeEnum::Value::ReplicatedBulkAvatarData;
+            << PacketTypeEnum::Value::ReplicatedKillAvatar << PacketTypeEnum::Value::ReplicatedBulkAvatarData
+            << PacketTypeEnum::Value::AvatarZonePresence;
         return NON_SOURCED_PACKETS;
     }
 
@@ -248,7 +251,37 @@ enum class EntityVersion : PacketVersion {
     MaterialRepeat,
     EntityHostTypes,
     CleanupProperties,
-    ImageEntities
+    ImageEntities,
+    GridEntities,
+    MissingTextProperties,
+    GrabTraits,
+    MorePropertiesCleanup,
+    FixPropertiesFromCleanup,
+    UpdatedPolyLines,
+    FixProtocolVersionBumpMismatch,
+    MigrateOverlayRenderProperties,
+    MissingWebEntityProperties,
+    PulseProperties,
+    RingGizmoEntities,
+    AvatarPriorityZone,
+    ShowKeyboardFocusHighlight,
+    WebBillboardMode,
+    ModelScale,
+    ReOrderParentIDProperties,
+    CertificateTypeProperty,
+    DisableWebMedia,
+    ParticleShapeType,
+    ParticleShapeTypeDeadlockFix,
+    PrivateUserData,
+    TextUnlit,
+    ShadowBiasAndDistance,
+    TextEntityFonts,
+    ScriptServerKinematicMotion,
+    ScreenshareZone,
+
+    // Add new versions above here
+    NUM_PACKET_TYPE,
+    LAST_PACKET_TYPE = NUM_PACKET_TYPE - 1
 };
 
 enum class EntityScriptCallMethodVersion : PacketVersion {
@@ -301,7 +334,16 @@ enum class AvatarMixerPacketVersion : PacketVersion {
     MigrateSkeletonURLToTraits,
     MigrateAvatarEntitiesToTraits,
     FarGrabJointsRedux,
-    JointTransScaled
+    JointTransScaled,
+    GrabTraits,
+    CollisionFlag,
+    AvatarTraitsAck,
+    FasterAvatarEntities,
+    SendMaxTranslationDimension,
+    FBXJointOrderChange,
+    HandControllerSection,
+    SendVerificationFailed,
+    ARKitBlendshapes
 };
 
 enum class DomainConnectRequestVersion : PacketVersion {
@@ -310,7 +352,11 @@ enum class DomainConnectRequestVersion : PacketVersion {
     HasProtocolVersions,
     HasMACAddress,
     HasMachineFingerprint,
-    AlwaysHasMachineFingerprint
+    AlwaysHasMachineFingerprint,
+    HasTimestamp,
+    HasReason,
+    HasSystemInfo,
+    HasCompressedSystemInfo
 };
 
 enum class DomainConnectionDeniedVersion : PacketVersion {
@@ -329,7 +375,9 @@ enum class DomainListVersion : PacketVersion {
     PermissionsGrid,
     GetUsernameFromUUIDSupport,
     GetMachineFingerprintFromUUIDSupport,
-    AuthenticationOptional
+    AuthenticationOptional,
+    HasTimestamp,
+    HasConnectReason
 };
 
 enum class AudioVersion : PacketVersion {
@@ -340,6 +388,7 @@ enum class AudioVersion : PacketVersion {
     SpaceBubbleChanges,
     HasPersonalMute,
     HighDynamicRangeVolume,
+    StopInjectors
 };
 
 enum class MessageDataVersion : PacketVersion {

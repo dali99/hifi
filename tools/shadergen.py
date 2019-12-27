@@ -49,11 +49,43 @@ def getCommonScribeArgs(scribefile, includeLibs):
     scribeArgs.append(scribefile)
     return scribeArgs
 
-def getDialectAndVariantHeaders(dialect, variant):
+extensionsHeaderMutex = Lock()
+
+def getExtensionsHeader(dialect, variant, extensions):
+    extensionHeader = '{}/extensions_{}_{}.glsl'.format(args.build_dir, dialect, variant)
+    global extensionsHeaderMutex
+    extensionsHeaderMutex.acquire()
+    if not os.path.exists(extensionHeader):
+        extensionsDefines = []
+        for extension in extensions:
+            extensionsDefines.append('#define HAVE_{}'.format(extension))
+        # make sure we end with a line feed
+        extensionsDefines.append("\r\n")
+        with open(extensionHeader, "w") as f:
+            f.write('\r\n'.join(extensionsDefines))
+    extensionsHeaderMutex.release()
+    return extensionHeader
+
+def getDialectAndVariantHeaders(dialect, variant, extensions=None):
+    result = []
     headerPath = args.source_dir + '/libraries/shaders/headers/'
-    variantHeader = headerPath + ('stereo.glsl' if (variant == 'stereo') else 'mono.glsl')
+    versionHeader = headerPath + dialect + '/version.glsl'
+    result.append(versionHeader)
+    if extensions is not None:
+        result.append(getExtensionsHeader(dialect, variant, extensions))
     dialectHeader = headerPath + dialect + '/header.glsl'
-    return [dialectHeader, variantHeader]
+    result.append(dialectHeader)
+    variantHeader = headerPath + ('stereo.glsl' if (variant == 'stereo') else 'mono.glsl')
+    result.append(variantHeader)
+    return result
+
+def getDefines(defines):
+    definesList = []
+    if defines:
+        definesSplit = defines.split("_")
+        for define in definesSplit:
+            definesList.append('HIFI_USE_{} 1'.format(define.upper()))
+    return definesList
 
 class ScribeDependenciesCache:
     cache = {}
@@ -74,9 +106,9 @@ class ScribeDependenciesCache:
         with open(self.filename, "w") as f:
             f.write(json.dumps(self.cache))
 
-    def get(self, scribefile, dialect, variant):
+    def get(self, scribefile, dialect, variant, defines):
         self.lock.acquire()
-        key = self.key(scribefile, dialect, variant)
+        key = self.key(scribefile, dialect, variant, defines)
         try:
             if key in self.cache:
                 return self.cache[key].copy()
@@ -84,25 +116,26 @@ class ScribeDependenciesCache:
             self.lock.release()
         return None
 
-    def key(self, scribeFile, dialect, variant):
-        return ':'.join([scribeFile, dialect, variant])
+    def key(self, scribeFile, dialect, variant, defines):
+        return ':'.join([scribeFile, dialect, variant, defines])
 
-    def getOrGen(self, scribefile, includeLibs, dialect, variant):
-        result = self.get(scribefile, dialect, variant)
-        if (None == result):
-            result = self.gen(scribefile, includeLibs, dialect, variant)
+    def getOrGen(self, scribefile, includeLibs, dialect, variant, defines):
+        result = self.get(scribefile, dialect, variant, defines)
+        if result is None:
+            result = self.gen(scribefile, includeLibs, dialect, variant, defines)
         return result
 
-    def gen(self, scribefile, includeLibs, dialect, variant):
+    def gen(self, scribefile, includeLibs, dialect, variant, defines):
         scribeArgs = getCommonScribeArgs(scribefile, includeLibs)
         scribeArgs.extend(['-M'])
         processResult = subprocess.run(scribeArgs, stdout=subprocess.PIPE)
         if (0 != processResult.returncode):
-            raise RuntimeError("Unable to parse scribe dependencies")
+            raise RuntimeError("Unable to parse scribe dependencies for file {} with defines: {}".format(scribefile, defines))
         result = processResult.stdout.decode("utf-8").splitlines(False)
         result.append(scribefile)
         result.extend(getDialectAndVariantHeaders(dialect, variant))
-        key = self.key(scribefile, dialect, variant)
+        result.extend(getDefines(defines))
+        key = self.key(scribefile, dialect, variant, defines)
         self.lock.acquire()
         self.cache[key] = result.copy()
         self.lock.release()
@@ -141,6 +174,10 @@ def processCommand(line):
     variant = params.pop(0)
     scribeFile  = args.source_dir + '/' + params.pop(0)
     unoptGlslFile = args.source_dir + '/' + params.pop(0)
+    defines = ""
+    if len(params) > 1 and params[0].startswith("defines:"):
+        defines = params.pop(0)
+        defines = defines[len("defines:"):]
     libs = params
 
     upoptSpirvFile = unoptGlslFile + '.spv'
@@ -159,19 +196,23 @@ def processCommand(line):
         os.makedirs(scribeOutputDir) 
     folderMutex.release()
 
-    scribeDeps = scribeDepCache.getOrGen(scribeFile, libs, dialect, variant)
+    scribeDeps = scribeDepCache.getOrGen(scribeFile, libs, dialect, variant, defines)
 
     # if the scribe sources (slv, slf, slh, etc), or the dialect/ variant headers are out of date
     # regenerate the scribe GLSL output
     if args.force or outOfDate(scribeDeps, outputFiles):
-        print('Processing file {} dialect {} variant {}'.format(scribeFile, dialect, variant))
+        print('Processing file {} dialect {} variant {} defines {}'.format(scribeFile, dialect, variant, defines))
         if args.dry_run:
             return True
 
-        scribeDepCache.gen(scribeFile, libs, dialect, variant)
+        scribeDepCache.gen(scribeFile, libs, dialect, variant, defines)
         scribeArgs = getCommonScribeArgs(scribeFile, libs)
-        for header in getDialectAndVariantHeaders(dialect, variant):
+        for header in getDialectAndVariantHeaders(dialect, variant, args.extensions):
             scribeArgs.extend(['-H', header])
+        for define in getDefines(defines):
+            defineArgs = ['-D']
+            defineArgs.extend(define.split(' '))
+            scribeArgs.extend(defineArgs)
         scribeArgs.extend(['-o', unoptGlslFile])
         executeSubprocess(scribeArgs)
 
@@ -218,6 +259,7 @@ def main():
 
 
 parser = ArgumentParser(description='Generate shader artifacts.')
+parser.add_argument('--extensions', type=str, nargs='*', help='Available extensions for the shaders')
 parser.add_argument('--commands', type=argparse.FileType('r'), help='list of commands to execute')
 parser.add_argument('--tools-dir', type=str, help='location of the host compatible binaries')
 parser.add_argument('--build-dir', type=str, help='The build directory base path')
@@ -230,8 +272,8 @@ args = None
 if len(sys.argv) == 1:
     # for debugging
     sourceDir = expanduser('~/git/hifi')
-    toolsDir = os.path.join(expanduser('~/git/vcpkg'), 'installed', 'x64-windows', 'tools')
-    buildPath = sourceDir + '/build'
+    toolsDir = 'd:/hifi/vcpkg/android/fd82f0a8/installed/x64-windows/tools'
+    buildPath = sourceDir + '/build_android'
     commandsPath = buildPath + '/libraries/shaders/shadergen.txt'
     shaderDir = buildPath + '/libraries/shaders'
     testArgs = '--commands {} --tools-dir {} --build-dir {} --source-dir {}'.format(
@@ -239,6 +281,7 @@ if len(sys.argv) == 1:
     ).split()
     testArgs.append('--debug')
     testArgs.append('--force')
+    testArgs.extend('--extensions EXT_clip_cull_distance'.split())
     #testArgs.append('--dry-run')
     args = parser.parse_args(testArgs)
 else:

@@ -53,6 +53,13 @@ bool OculusDisplayPlugin::internalActivate() {
 void OculusDisplayPlugin::init() {
     Plugin::init();
 
+    // Different HMDs end up showing the squeezed-vision egg as different sizes.  These values
+    // attempt to make them appear the same.
+    _visionSqueezeDeviceLowX = 0.7f;
+    _visionSqueezeDeviceHighX = 0.98f;
+    _visionSqueezeDeviceLowY = 0.7f;
+    _visionSqueezeDeviceHighY = 0.9f;
+
     emit deviceConnected(getName());
 }
 
@@ -138,6 +145,10 @@ void OculusDisplayPlugin::hmdPresent() {
         return;
     }
 
+    if (!_currentFrame) {
+        return;
+    }
+
     PROFILE_RANGE_EX(render, __FUNCTION__, 0xff00ff00, (uint64_t)_currentFrame->frameIndex)
 
     {
@@ -147,8 +158,11 @@ void OculusDisplayPlugin::hmdPresent() {
         GLuint curTexId;
         ovr_GetTextureSwapChainBufferGL(_session, _textureSwapChain, curIndex, &curTexId);
 
+        _visionSqueezeParametersBuffer.edit<VisionSqueezeParameters>()._leftProjection = _eyeProjections[0];
+        _visionSqueezeParametersBuffer.edit<VisionSqueezeParameters>()._rightProjection = _eyeProjections[1];
+
         // Manually bind the texture to the FBO
-        // FIXME we should have a way of wrapping raw GL ids in GPU objects without 
+        // FIXME we should have a way of wrapping raw GL ids in GPU objects without
         // taking ownership of the object
         auto fbo = getGLBackend()->getFramebufferID(_outputFramebuffer);
         glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0, curTexId, 0);
@@ -159,7 +173,7 @@ void OculusDisplayPlugin::hmdPresent() {
             batch.setStateScissorRect(ivec4(uvec2(), _outputFramebuffer->getSize()));
             batch.resetViewTransform();
             batch.setProjectionTransform(mat4());
-            batch.setPipeline(_presentPipeline);
+            batch.setPipeline(_drawTexturePipeline);
             batch.setResourceTexture(0, _compositeFramebuffer->getRenderBuffer(0));
             batch.draw(gpu::TRIANGLE_STRIP, 4);
         });

@@ -14,6 +14,8 @@ import QtQuick 2.5
 import controlsUit 1.0 as HifiControlsUit
 import stylesUit 1.0 as HifiStylesUit
 
+import TabletScriptingInterface 1.0
+
 import "../LoginDialog"
 
 FocusScope {
@@ -21,43 +23,36 @@ FocusScope {
     objectName: "LoginDialog"
     visible: true
 
+    HifiStylesUit.HifiConstants { id: hifi }
+
     anchors.fill: parent
-    width: parent.width
-    height: parent.height
 
-    signal sendToScript(var message);
-    signal canceled();
+    readonly property bool isTablet: true
+    readonly property bool isOverlay: false
 
-    property bool isHMD: false
-    property bool gotoPreviousApp: false;
-
+    property string iconText: hifi.glyphs.avatar
+    property int iconSize: 35
     property bool keyboardEnabled: false
     property bool keyboardRaised: false
     property bool punctuationMode: false
     property bool isPassword: false
 
-    readonly property bool isTablet: true
-    readonly property bool isOverlay: false
-    property alias text: loginKeyboard.mirroredText
-
-    property int titleWidth: 0
     property alias bannerWidth: banner.width
     property alias bannerHeight: banner.height
-    property string iconText: hifi.glyphs.avatar
-    property int iconSize: 35
 
-    property var pane: QtObject {
-        property real width: root.width
-        property real height: root.height
-    }
+    property int titleWidth: 0
 
-    function tryDestroy() {
-    }
+    property bool isHMD: HMD.active
 
-    MouseArea {
-        width: root.width
-        height: root.height
-    }
+    // TABLET SPECIFIC PROPERTIES START //
+    property alias text: loginKeyboard.mirroredText
+
+    width: parent.width
+    height: parent.height
+
+    property var tabletProxy: Tablet.getTablet("com.highfidelity.interface.tablet.system")
+
+    property bool gotoPreviousApp: false
 
     property bool keyboardOverride: true
 
@@ -68,7 +63,20 @@ FocusScope {
     property alias loginDialog: loginDialog
     property alias hifi: hifi
 
-    HifiStylesUit.HifiConstants { id: hifi }
+    property var pane: QtObject {
+        property real width: root.width
+        property real height: root.height
+    }
+
+    MouseArea {
+        width: root.width
+        height: root.height
+    }
+    // TABLET SPECIFIC PROPERTIES END //
+
+    function tryDestroy() {
+            tabletProxy.gotoHomeScreen();
+    }
 
     Timer {
         id: keyboardTimer
@@ -76,7 +84,7 @@ FocusScope {
         interval: 200
 
         onTriggered: {
-            if (MenuInterface.isOptionChecked("Use 3D Keyboard")) {
+            if (MenuInterface.isOptionChecked("Use 3D Keyboard") && root.isHMD) {
                 KeyboardScriptingInterface.raised = true;
             }
         }
@@ -95,8 +103,18 @@ FocusScope {
     Image {
         z: -10
         id: loginDialogBackground
-        source: "../LoginDialog/images/background_tablet.jpg"
+        fillMode: Image.PreserveAspectCrop
+        source: "../LoginDialog/images/background_tablet.png"
         anchors.fill: parent
+    }
+
+    Rectangle {
+        z: -6
+        id: opaqueRect
+        height: parent.height
+        width: parent.width
+        opacity: 0.65
+        color: "black"
     }
 
     Item {
@@ -114,15 +132,6 @@ FocusScope {
             source: "../../images/high-fidelity-banner.svg"
             horizontalAlignment: Image.AlignHCenter
         }
-    }
-
-    Rectangle {
-        z: -6
-        id: opaqueRect
-        height: parent.height
-        width: parent.width
-        opacity: 0.65
-        color: "black"
     }
 
     HifiControlsUit.Keyboard {
@@ -168,11 +177,13 @@ FocusScope {
 
     Component.onDestruction: {
         loginKeyboard.raised = false;
-        KeyboardScriptingInterface.raised = false;
+        if (root.isHMD) {
+            KeyboardScriptingInterface.raised = false;
+        }
     }
 
     Component.onCompleted: {
         keyboardTimer.start();
-        bodyLoader.setSource("../LoginDialog/LinkAccountBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "linkSteam": false });
+        bodyLoader.setSource("../LoginDialog/LinkAccountBody.qml", { "loginDialog": loginDialog, "root": root, "bodyLoader": bodyLoader, "linkSteam": false, "linkOculus": false });
     }
 }

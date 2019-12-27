@@ -67,18 +67,29 @@ const QUuid SpatiallyNestable::getParentID() const {
 }
 
 void SpatiallyNestable::setParentID(const QUuid& parentID) {
+    bumpAncestorChainRenderableVersion();
+    bool success = false;
+    auto parent = getParentPointer(success);
+    bool parentChanged = false;
     _idLock.withWriteLock([&] {
         if (_parentID != parentID) {
+            parentChanged = true;
             _parentID = parentID;
             _parentKnowsMe = false;
         }
     });
 
+    if (parentChanged && success && parent) {
+        parent->recalculateChildCauterization();
+    }
+
     if (!_parentKnowsMe) {
-        bool success = false;
-        auto parent = getParentPointer(success);
+        success = false;
+        parent = getParentPointer(success);
         if (success && parent) {
+            bumpAncestorChainRenderableVersion();
             parent->updateQueryAACube();
+            parent->recalculateChildCauterization();
         }
     }
 }
@@ -90,7 +101,7 @@ Transform SpatiallyNestable::getParentTransform(bool& success, int depth) const 
         return result;
     }
     if (parent) {
-        result = parent->getTransform(_parentJointIndex, success, depth + 1);
+        result = parent->getJointTransform(_parentJointIndex, success, depth + 1);
         if (getScalesWithParent()) {
             result.setScale(parent->scaleForChildren());
         }
@@ -108,7 +119,8 @@ SpatiallyNestablePointer SpatiallyNestable::getParentPointer(bool& success) cons
         return nullptr;
     }
 
-    if (parent && parent->getID() == parentID) {
+    if (parent && (parent->getID() == parentID ||
+                   (parentID == AVATAR_SELF_ID && parent->isMyAvatar()))) {
         // parent pointer is up-to-date
         if (!_parentKnowsMe) {
             SpatialParentTree* parentTree = parent->getParentTree();
@@ -172,8 +184,9 @@ void SpatiallyNestable::forgetChild(SpatiallyNestablePointer newChild) const {
 
 void SpatiallyNestable::setParentJointIndex(quint16 parentJointIndex) {
     _parentJointIndex = parentJointIndex;
-    auto parent = _parent.lock();
-    if (parent) {
+    bool success = false;
+    auto parent = getParentPointer(success);
+    if (success && parent) {
         parent->recalculateChildCauterization();
     }
 }
@@ -200,7 +213,7 @@ glm::vec3 SpatiallyNestable::worldToLocal(const glm::vec3& position,
     }
 
     if (parent) {
-        parentTransform = parent->getTransform(parentJointIndex, success);
+        parentTransform = parent->getJointTransform(parentJointIndex, success);
         if (!success) {
             return glm::vec3(0.0f);
         }
@@ -237,7 +250,7 @@ glm::quat SpatiallyNestable::worldToLocal(const glm::quat& orientation,
     }
 
     if (parent) {
-        parentTransform = parent->getTransform(parentJointIndex, success);
+        parentTransform = parent->getJointTransform(parentJointIndex, success);
         if (!success) {
             return glm::quat();
         }
@@ -347,7 +360,7 @@ glm::vec3 SpatiallyNestable::localToWorld(const glm::vec3& position,
     }
 
     if (parent) {
-        parentTransform = parent->getTransform(parentJointIndex, success);
+        parentTransform = parent->getJointTransform(parentJointIndex, success);
         if (!success) {
             return glm::vec3(0.0f);
         }
@@ -387,7 +400,7 @@ glm::quat SpatiallyNestable::localToWorld(const glm::quat& orientation,
     }
 
     if (parent) {
-        parentTransform = parent->getTransform(parentJointIndex, success);
+        parentTransform = parent->getJointTransform(parentJointIndex, success);
         if (!success) {
             return glm::quat();
         }
@@ -481,27 +494,29 @@ void SpatiallyNestable::setWorldTransform(const glm::vec3& position, const glm::
         return;
     }
 
-    bool changed = false;
     bool success = true;
     Transform parentTransform = getParentTransform(success);
-    _transformLock.withWriteLock([&] {
-        Transform myWorldTransform;
-        Transform::mult(myWorldTransform, parentTransform, _transform);
-        if (myWorldTransform.getRotation() != orientation) {
-            changed = true;
-            myWorldTransform.setRotation(orientation);
-        }
-        if (myWorldTransform.getTranslation() != position) {
-            changed = true;
-            myWorldTransform.setTranslation(position);
-        }
+    if (success) {
+        bool changed = false;
+        _transformLock.withWriteLock([&] {
+            Transform myWorldTransform;
+            Transform::mult(myWorldTransform, parentTransform, _transform);
+            if (myWorldTransform.getRotation() != orientation) {
+                changed = true;
+                myWorldTransform.setRotation(orientation);
+            }
+            if (myWorldTransform.getTranslation() != position) {
+                changed = true;
+                myWorldTransform.setTranslation(position);
+            }
+            if (changed) {
+                Transform::inverseMult(_transform, parentTransform, myWorldTransform);
+                _translationChanged = usecTimestampNow();
+            }
+        });
         if (changed) {
-            Transform::inverseMult(_transform, parentTransform, myWorldTransform);
-            _translationChanged = usecTimestampNow();
+            locationChanged(false);
         }
-    });
-    if (success && changed) {
-        locationChanged(false);
     }
 }
 
@@ -520,8 +535,8 @@ glm::vec3 SpatiallyNestable::getWorldPosition() const {
     return result;
 }
 
-glm::vec3 SpatiallyNestable::getWorldPosition(int jointIndex, bool& success) const {
-    return getTransform(jointIndex, success).getTranslation();
+glm::vec3 SpatiallyNestable::getJointWorldPosition(int jointIndex, bool& success) const {
+    return getJointTransform(jointIndex, success).getTranslation();
 }
 
 void SpatiallyNestable::setWorldPosition(const glm::vec3& position, bool& success, bool tellPhysics) {
@@ -574,7 +589,7 @@ glm::quat SpatiallyNestable::getWorldOrientation() const {
 }
 
 glm::quat SpatiallyNestable::getWorldOrientation(int jointIndex, bool& success) const {
-    return getTransform(jointIndex, success).getRotation();
+    return getJointTransform(jointIndex, success).getRotation();
 }
 
 void SpatiallyNestable::setWorldOrientation(const glm::quat& orientation, bool& success, bool tellPhysics) {
@@ -743,7 +758,11 @@ const Transform SpatiallyNestable::getTransform() const {
     bool success;
     Transform result = getTransform(success);
     if (!success) {
-        qCDebug(shared) << "getTransform failed for" << getID();
+        // There is a known issue related to child entities not being deleted
+        // when their parent is removed. This has the side-effect that the
+        // logs will be spammed with the following message. Until this is
+        // fixed, this log message will be suppressed.
+        //qCDebug(shared) << "getTransform failed for" << getID();
     }
     return result;
 }
@@ -760,7 +779,7 @@ void SpatiallyNestable::breakParentingLoop() const {
     }
 }
 
-const Transform SpatiallyNestable::getTransform(int jointIndex, bool& success, int depth) const {
+const Transform SpatiallyNestable::getJointTransform(int jointIndex, bool& success, int depth) const {
     // this returns the world-space transform for this object.  It finds its parent's transform (which may
     // cause this object's parent to query its parent, etc) and multiplies this object's local transform onto it.
     Transform jointInWorldFrame;
@@ -788,19 +807,21 @@ void SpatiallyNestable::setTransform(const Transform& transform, bool& success) 
         return;
     }
 
-    bool changed = false;
     Transform parentTransform = getParentTransform(success);
-    _transformLock.withWriteLock([&] {
-        Transform beforeTransform = _transform;
-        Transform::inverseMult(_transform, parentTransform, transform);
-        if (_transform != beforeTransform) {
-            changed = true;
-            _translationChanged = usecTimestampNow();
-            _rotationChanged = usecTimestampNow();
+    if (success) {
+        bool changed = false;
+        _transformLock.withWriteLock([&] {
+            Transform beforeTransform = _transform;
+            Transform::inverseMult(_transform, parentTransform, transform);
+            if (_transform != beforeTransform) {
+                changed = true;
+                _translationChanged = usecTimestampNow();
+                _rotationChanged = usecTimestampNow();
+            }
+        });
+        if (changed) {
+            locationChanged();
         }
-    });
-    if (success && changed) {
-        locationChanged();
     }
 }
 
@@ -825,8 +846,8 @@ glm::vec3 SpatiallyNestable::getSNScale(bool& success) const {
     return getTransform(success).getScale();
 }
 
-glm::vec3 SpatiallyNestable::getSNScale(int jointIndex, bool& success) const {
-    return getTransform(jointIndex, success).getScale();
+glm::vec3 SpatiallyNestable::getJointSNScale(int jointIndex, bool& success) const {
+    return getJointTransform(jointIndex, success).getScale();
 }
 
 void SpatiallyNestable::setSNScale(const glm::vec3& scale) {
@@ -854,7 +875,7 @@ void SpatiallyNestable::setSNScale(const glm::vec3& scale, bool& success) {
         }
     });
     if (success && changed) {
-        locationChanged();
+        dimensionsChanged();
     }
 }
 
@@ -1093,10 +1114,12 @@ void SpatiallyNestable::forEachDescendantTest(const ChildLambdaTest& actor) cons
     }
 }
 
-void SpatiallyNestable::locationChanged(bool tellPhysics) {
-    forEachChild([&](SpatiallyNestablePointer object) {
-        object->locationChanged(tellPhysics);
-    });
+void SpatiallyNestable::locationChanged(bool tellPhysics, bool tellChildren) {
+    if (tellChildren) {
+        forEachChild([&](SpatiallyNestablePointer object) {
+            object->locationChanged(tellPhysics, tellChildren);
+        });
+    }
 }
 
 AACube SpatiallyNestable::getMaximumAACube(bool& success) const {
@@ -1325,15 +1348,26 @@ SpatiallyNestablePointer SpatiallyNestable::findByID(QUuid id, bool& success) {
     return parentWP.lock();
 }
 
-
+/**jsdoc
+ * <p>An in-world item may be one of the following types:</p>
+ * <table>
+ *   <thead>
+ *     <tr><th>Value</th><th>Description</th></tr>
+ *   </thead>
+ *   <tbody>
+ *     <tr><td><code>"entity"</code></td><td>The item is an entity.</td></tr>
+ *     <tr><td><code>"avatar"</code></td><td>The item is an avatar.</td></tr>
+ *     <tr><td><code>"unknown"</code></td><td>The item cannot be found.</td></tr>
+ *   </tbody>
+ * </table>
+ * @typedef {string} Entities.NestableType
+ */
 QString SpatiallyNestable::nestableTypeToString(NestableType nestableType) {
     switch(nestableType) {
         case NestableType::Entity:
             return "entity";
         case NestableType::Avatar:
             return "avatar";
-        case NestableType::Overlay:
-            return "overlay";
         default:
             return "unknown";
     }
@@ -1368,4 +1402,63 @@ bool SpatiallyNestable::isParentPathComplete(int depth) const {
     }
 
     return parent->isParentPathComplete(depth + 1);
+}
+
+void SpatiallyNestable::addGrab(GrabPointer grab) {
+    _grabsLock.withWriteLock([&] {
+        _grabs.insert(grab);
+    });
+}
+
+void SpatiallyNestable::removeGrab(GrabPointer grab) {
+    _grabsLock.withWriteLock([&] {
+        _grabs.remove(grab);
+    });
+}
+
+bool SpatiallyNestable::hasGrabs() {
+    bool result { false };
+    _grabsLock.withReadLock([&] {
+        foreach (const GrabPointer &grab, _grabs) {
+            if (grab && !grab->getReleased()) {
+                result = true;
+                break;
+            }
+        }
+    });
+    return result;
+}
+
+QUuid SpatiallyNestable::getEditSenderID() {
+    // if more than one avatar is grabbing something, decide which one should tell the enity-server about it
+    QUuid editSenderID;
+    bool editSenderIDSet { false };
+    _grabsLock.withReadLock([&] {
+        foreach (const GrabPointer &grab, _grabs) {
+            QUuid ownerID = grab->getOwnerID();
+            if (!editSenderIDSet) {
+                editSenderID = ownerID;
+                editSenderIDSet = true;
+            } else {
+                if (ownerID < editSenderID) {
+                    editSenderID = ownerID;
+                }
+            }
+        }
+    });
+    return editSenderID;
+}
+
+void SpatiallyNestable::bumpAncestorChainRenderableVersion(int depth) const {
+    if (depth > MAX_PARENTING_CHAIN_SIZE) {
+        // can't break the parent chain here, because it will call setParentID, which calls this
+        return;
+    }
+
+    _ancestorChainRenderableVersion++;
+    bool success = false;
+    auto parent = getParentPointer(success);
+    if (success && parent) {
+        parent->bumpAncestorChainRenderableVersion(depth + 1);
+    }
 }

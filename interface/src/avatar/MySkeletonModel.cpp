@@ -10,10 +10,12 @@
 
 #include <avatars-renderer/Avatar.h>
 #include <DebugDraw.h>
+#include <CubicHermiteSpline.h>
 
 #include "Application.h"
 #include "InterfaceLogging.h"
 #include "AnimUtil.h"
+
 
 
 MySkeletonModel::MySkeletonModel(Avatar* owningAvatar, QObject* parent) : SkeletonModel(owningAvatar, parent) {
@@ -30,8 +32,26 @@ Rig::CharacterControllerState convertCharacterControllerState(CharacterControlle
             return Rig::CharacterControllerState::InAir;
         case CharacterController::State::Hover:
             return Rig::CharacterControllerState::Hover;
+        case CharacterController::State::Seated:
+            return Rig::CharacterControllerState::Seated;
     };
 }
+
+#if defined(Q_OS_ANDROID) || defined(HIFI_USE_OPTIMIZED_IK)
+static glm::vec3 computeSpine2WithHeadHipsSpline(MyAvatar* myAvatar, AnimPose hipsIKTargetPose, AnimPose headIKTargetPose) {
+
+    // the the ik targets to compute the spline with
+    CubicHermiteSplineFunctorWithArcLength splineFinal(headIKTargetPose.rot(), headIKTargetPose.trans(), hipsIKTargetPose.rot(), hipsIKTargetPose.trans());
+
+    // measure the total arc length along the spline
+    float totalArcLength = splineFinal.arcLength(1.0f);
+    float tFinal = splineFinal.arcLengthInverse(myAvatar->getSpine2SplineRatio() * totalArcLength);
+    glm::vec3 spine2Translation = splineFinal(tFinal);
+
+    return spine2Translation + myAvatar->getSpine2SplineOffset();
+
+}
+#endif
 
 static AnimPose computeHipsInSensorFrame(MyAvatar* myAvatar, bool isFlying) {
     glm::mat4 worldToSensorMat = glm::inverse(myAvatar->getSensorToWorldMatrix());
@@ -92,19 +112,19 @@ static AnimPose computeHipsInSensorFrame(MyAvatar* myAvatar, bool isFlying) {
 void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
     const HFMModel& hfmModel = getHFMModel();
 
-    Head* head = _owningAvatar->getHead();
-
-    // make sure lookAt is not too close to face (avoid crosseyes)
-    glm::vec3 lookAt = head->getLookAtPosition();
-    glm::vec3 focusOffset = lookAt - _owningAvatar->getHead()->getEyePosition();
-    float focusDistance = glm::length(focusOffset);
-    const float MIN_LOOK_AT_FOCUS_DISTANCE = 1.0f;
-    if (focusDistance < MIN_LOOK_AT_FOCUS_DISTANCE && focusDistance > EPSILON) {
-        lookAt = _owningAvatar->getHead()->getEyePosition() + (MIN_LOOK_AT_FOCUS_DISTANCE / focusDistance) * focusOffset;
-    }
-
     MyAvatar* myAvatar = static_cast<MyAvatar*>(_owningAvatar);
     assert(myAvatar);
+
+    Head* head = _owningAvatar->getHead();
+
+    bool eyePosesValid = (myAvatar->getControllerPoseInSensorFrame(controller::Action::LEFT_EYE).isValid() ||
+                          myAvatar->getControllerPoseInSensorFrame(controller::Action::RIGHT_EYE).isValid());
+    glm::vec3 lookAt;
+    if (eyePosesValid) {
+        lookAt = head->getLookAtPosition(); // don't apply no-crosseyes code when eyes are being tracked
+    } else {
+        lookAt = avoidCrossedEyes(head->getLookAtPosition());
+    }
 
     Rig::ControllerParameters params;
 
@@ -187,7 +207,7 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
         }
     }
 
-    bool isFlying = (myAvatar->getCharacterController()->getState() == CharacterController::State::Hover || myAvatar->getCharacterController()->computeCollisionGroup() == BULLET_COLLISION_GROUP_COLLISIONLESS);
+    bool isFlying = (myAvatar->getCharacterController()->getState() == CharacterController::State::Hover || myAvatar->getCharacterController()->computeCollisionMask() == BULLET_COLLISION_MASK_COLLISIONLESS);
     if (isFlying != _prevIsFlying) {
         const float FLY_TO_IDLE_HIPS_TRANSITION_TIME = 0.5f;
         _flyIdleTimer = FLY_TO_IDLE_HIPS_TRANSITION_TIME;
@@ -198,7 +218,7 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
 
     // if hips are not under direct control, estimate the hips position.
     if (avatarHeadPose.isValid() && !(params.primaryControllerFlags[Rig::PrimaryControllerType_Hips] & (uint8_t)Rig::ControllerFlags::Enabled)) {
-        bool isFlying = (myAvatar->getCharacterController()->getState() == CharacterController::State::Hover || myAvatar->getCharacterController()->computeCollisionGroup() == BULLET_COLLISION_GROUP_COLLISIONLESS);
+        bool isFlying = (myAvatar->getCharacterController()->getState() == CharacterController::State::Hover || myAvatar->getCharacterController()->computeCollisionMask() == BULLET_COLLISION_MASK_COLLISIONLESS);
 
         // timescale in seconds
         const float TRANS_HORIZ_TIMESCALE = 0.15f;
@@ -233,6 +253,12 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
             myAvatar->getControllerPoseInAvatarFrame(controller::Action::LEFT_HAND).isValid() &&
             !(params.primaryControllerFlags[Rig::PrimaryControllerType_Spine2] & (uint8_t)Rig::ControllerFlags::Enabled)) {
 
+#if defined(Q_OS_ANDROID) || defined(HIFI_USE_OPTIMIZED_IK)
+            AnimPose headAvatarSpace(avatarHeadPose.getRotation(), avatarHeadPose.getTranslation());
+            AnimPose headRigSpace = avatarToRigPose * headAvatarSpace;
+            AnimPose hipsRigSpace = sensorToRigPose * sensorHips;
+            glm::vec3 spine2TargetTranslation = computeSpine2WithHeadHipsSpline(myAvatar, hipsRigSpace, headRigSpace);
+#endif
             const float SPINE2_ROTATION_FILTER = 0.5f;
             AnimPose currentSpine2Pose;
             AnimPose currentHeadPose;
@@ -243,6 +269,9 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
             if (spine2Exists && headExists && hipsExists) {
 
                 AnimPose rigSpaceYaw(myAvatar->getSpine2RotationRigSpace());
+#if defined(Q_OS_ANDROID) || defined(HIFI_USE_OPTIMIZED_IK)
+                rigSpaceYaw.rot() = safeLerp(Quaternions::IDENTITY, rigSpaceYaw.rot(), 0.5f);
+#endif
                 glm::vec3 u, v, w;
                 glm::vec3 fwd = rigSpaceYaw.rot() * glm::vec3(0.0f, 0.0f, 1.0f);
                 glm::vec3 up = currentHeadPose.trans() - currentHipsPose.trans();
@@ -253,6 +282,9 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
                 }
                 generateBasisVectors(up, fwd, u, v, w);
                 AnimPose newSpinePose(glm::mat4(glm::vec4(w, 0.0f), glm::vec4(u, 0.0f), glm::vec4(v, 0.0f), glm::vec4(glm::vec3(0.0f, 0.0f, 0.0f), 1.0f)));
+#if defined(Q_OS_ANDROID) || defined(HIFI_USE_OPTIMIZED_IK)
+                currentSpine2Pose.trans() = spine2TargetTranslation;
+#endif
                 currentSpine2Pose.rot() = safeLerp(currentSpine2Pose.rot(), newSpinePose.rot(), SPINE2_ROTATION_FILTER);
                 params.primaryControllerPoses[Rig::PrimaryControllerType_Spine2] = currentSpine2Pose;
                 params.primaryControllerFlags[Rig::PrimaryControllerType_Spine2] = (uint8_t)Rig::ControllerFlags::Enabled | (uint8_t)Rig::ControllerFlags::Estimated;
@@ -263,8 +295,6 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
     } else {
         _prevIsEstimatingHips = false;
     }
-
-    params.isTalking = head->getTimeWithoutTalking() <= 1.5f;
 
     // pass detailed torso k-dops to rig.
     int hipsJoint = _rig.indexOfJoint("Hips");
@@ -283,6 +313,14 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
     if (spine2Joint >= 0) {
         params.spine2ShapeInfo = hfmModel.joints[spine2Joint].shapeInfo;
     }
+    const float TALKING_TIME_THRESHOLD = 0.75f;
+    params.isTalking = head->getTimeWithoutTalking() <= TALKING_TIME_THRESHOLD;
+
+    //pass X and Z input key floats (-1 to 1) to rig
+    params.inputX = myAvatar->getDriveKey(MyAvatar::TRANSLATE_X);
+    params.inputZ = myAvatar->getDriveKey(MyAvatar::TRANSLATE_Z);
+
+    myAvatar->updateRigControllerParameters(params);
 
     _rig.updateFromControllerParameters(params, deltaTime);
 
@@ -303,7 +341,6 @@ void MySkeletonModel::updateRig(float deltaTime, glm::mat4 parentTransform) {
     eyeParams.modelTranslation = getTranslation();
     eyeParams.leftEyeJointIndex = _rig.indexOfJoint("LeftEye");
     eyeParams.rightEyeJointIndex = _rig.indexOfJoint("RightEye");
-
     _rig.updateFromEyeParameters(eyeParams);
 
     updateFingers();

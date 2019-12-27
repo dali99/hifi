@@ -42,12 +42,14 @@ bool vhacd::VHACDUtil::loadFBX(const QString filename, HFMModel& result) {
         return false;
     }
     try {
-        QByteArray fbxContents = fbx.readAll();
+        hifi::ByteArray fbxContents = fbx.readAll();
         HFMModel::Pointer hfmModel;
+        hifi::VariantHash mapping;
+        mapping["deduplicateIndices"] = true;
         if (filename.toLower().endsWith(".obj")) {
-            hfmModel = OBJSerializer().read(fbxContents, QVariantHash(), filename);
+            hfmModel = OBJSerializer().read(fbxContents, mapping, filename);
         } else if (filename.toLower().endsWith(".fbx")) {
-            hfmModel = FBXSerializer().read(fbxContents, QVariantHash(), filename);
+            hfmModel = FBXSerializer().read(fbxContents, mapping, filename);
         } else {
             qWarning() << "file has unknown extension" << filename;
             return false;
@@ -147,12 +149,11 @@ void vhacd::VHACDUtil::fattenMesh(const HFMMesh& mesh, const glm::mat4& modelOff
         result.vertices << p3; // add the new point to the result mesh
 
         HFMMeshPart newMeshPart;
-        setMeshPartDefaults(newMeshPart, "unknown");
         newMeshPart.triangleIndices << index0 << index1 << index2;
         newMeshPart.triangleIndices << index0 << index3 << index1;
         newMeshPart.triangleIndices << index1 << index3 << index2;
         newMeshPart.triangleIndices << index2 << index3 << index0;
-        result.parts.append(newMeshPart);
+        result.parts.push_back(newMeshPart);
     }
 }
 
@@ -257,8 +258,8 @@ void vhacd::VHACDUtil::getConvexResults(VHACD::IVHACD* convexifier, HFMMesh& res
         VHACD::IVHACD::ConvexHull hull;
         convexifier->GetConvexHull(j, hull);
 
-        resultMesh.parts.append(HFMMeshPart());
-        HFMMeshPart& resultMeshPart = resultMesh.parts.last();
+        resultMesh.parts.push_back(HFMMeshPart());
+        HFMMeshPart& resultMeshPart = resultMesh.parts.back();
 
         int hullIndexStart = resultMesh.vertices.size();
         resultMesh.vertices.reserve(hullIndexStart + hull.m_nPoints);
@@ -298,8 +299,8 @@ bool vhacd::VHACDUtil::computeVHACD(HFMModel& hfmModel,
     }
 
     // count the mesh-parts
-    int numParts = 0;
-    foreach (const HFMMesh& mesh, hfmModel.meshes) {
+    size_t numParts = 0;
+    for (const HFMMesh& mesh : hfmModel.meshes) {
         numParts += mesh.parts.size();
     }
     if (_verbose) {
@@ -309,8 +310,8 @@ bool vhacd::VHACDUtil::computeVHACD(HFMModel& hfmModel,
     VHACD::IVHACD * convexifier = VHACD::CreateVHACD();
 
     result.meshExtents.reset();
-    result.meshes.append(HFMMesh());
-    HFMMesh &resultMesh = result.meshes.last();
+    result.meshes.push_back(HFMMesh());
+    HFMMesh &resultMesh = result.meshes.back();
 
     const uint32_t POINT_STRIDE = 3;
     const uint32_t TRIANGLE_STRIDE = 3;
@@ -346,7 +347,7 @@ bool vhacd::VHACDUtil::computeVHACD(HFMModel& hfmModel,
 
         if (_verbose) {
             qDebug() << "mesh" << meshIndex << ": "
-                << " parts =" << mesh.parts.size() << " clusters =" << mesh.clusters.size()
+                << " parts =" << mesh.parts.size()
                 << " vertices =" << numVertices;
         }
         ++meshIndex;

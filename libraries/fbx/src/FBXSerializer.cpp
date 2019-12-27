@@ -11,29 +11,16 @@
 
 #include "FBXSerializer.h"
 
-#include <iostream>
 #include <QBuffer>
-#include <QDataStream>
-#include <QIODevice>
-#include <QStringList>
-#include <QTextStream>
-#include <QtDebug>
-#include <QtEndian>
-#include <QFileInfo>
 
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtx/transform.hpp>
 
-#include <FaceshiftConstants.h>
-#include <GeometryUtil.h>
-#include <GLMHelpers.h>
-#include <NumericalConstants.h>
-#include <OctalCode.h>
-#include <gpu/Format.h>
-#include <LogHandler.h>
+#include <BlendshapeConstants.h>
 
 #include <hfm/ModelFormatLogging.h>
+#include <hfm/HFMModelMath.h>
 
 // TOOL: Uncomment the following line to enable the filtering of all the unkwnon fields of a node so we can break point easily while loading a model with problems...
 //#define DEBUG_FBXSERIALIZER
@@ -111,13 +98,24 @@ QString processID(const QString& id) {
     return id.mid(id.lastIndexOf(':') + 1);
 }
 
-QString getName(const QVariantList& properties) {
+QString getModelName(const QVariantList& properties) {
     QString name;
     if (properties.size() == 3) {
         name = properties.at(1).toString();
         name = processID(name.left(name.indexOf(QChar('\0'))));
     } else {
         name = processID(properties.at(0).toString());
+    }
+    return name;
+}
+
+QString getMaterialName(const QVariantList& properties) {
+    QString name;
+    if (properties.size() == 1 || properties.at(1).toString().isEmpty()) {
+        name = properties.at(0).toString();
+        name = processID(name.left(name.indexOf(QChar('\0'))));
+    } else {
+        name = processID(properties.at(1).toString());
     }
     return name;
 }
@@ -145,10 +143,12 @@ public:
     glm::vec3 geometricTranslation;
     glm::quat geometricRotation;
     glm::vec3 geometricScaling;
+    bool isLimbNode;  // is this FBXModel transform is a "LimbNode" i.e. a joint
 };
 
+
 glm::mat4 getGlobalTransform(const QMultiMap<QString, QString>& _connectionParentMap,
-        const QHash<QString, FBXModel>& fbxModels, QString nodeID, bool mixamoHack, const QString& url) {
+    const QHash<QString, FBXModel>& fbxModels, QString nodeID, bool mixamoHack, const QString& url) {
     glm::mat4 globalTransform;
     QVector<QString> visitedNodes; // Used to prevent following a cycle
     while (!nodeID.isNull()) {
@@ -168,20 +168,33 @@ glm::mat4 getGlobalTransform(const QMultiMap<QString, QString>& _connectionParen
         }
         QList<QString> parentIDs = _connectionParentMap.values(nodeID);
         nodeID = QString();
-        foreach (const QString& parentID, parentIDs) {
+        foreach(const QString& parentID, parentIDs) {
             if (visitedNodes.contains(parentID)) {
                 qCWarning(modelformat) << "Ignoring loop detected in FBX connection map for" << url;
                 continue;
             }
-
             if (fbxModels.contains(parentID)) {
                 nodeID = parentID;
                 break;
             }
         }
     }
-
     return globalTransform;
+}
+
+std::vector<QString> getModelIDsForMeshID(const QString& meshID, const QHash<QString, FBXModel>& fbxModels, const QMultiMap<QString, QString>& _connectionParentMap) {
+    std::vector<QString> modelsForMesh;
+    if (fbxModels.contains(meshID)) {
+        modelsForMesh.push_back(meshID);
+    } else {
+        // This mesh may have more than one parent model, with different material and transform, representing a different instance of the mesh
+        for (const auto& parentID : _connectionParentMap.values(meshID)) {
+            if (fbxModels.contains(parentID)) {
+                modelsForMesh.push_back(parentID);
+            }
+        }
+    }
+    return modelsForMesh;
 }
 
 class ExtractedBlendshape {
@@ -192,7 +205,7 @@ public:
 
 void printNode(const FBXNode& node, int indentLevel) {
     int indentLength = 2;
-    QByteArray spaces(indentLevel * indentLength, ' ');
+    hifi::ByteArray spaces(indentLevel * indentLength, ' ');
     QDebug nodeDebug = qDebug(modelformat);
 
     nodeDebug.nospace() << spaces.data() << node.name.data() << ": ";
@@ -314,15 +327,13 @@ QString getString(const QVariant& value) {
     return list.isEmpty() ? value.toString() : list.at(0).toString();
 }
 
-typedef std::vector<glm::vec3> ShapeVertices;
-
 class AnimationCurve {
 public:
     QVector<float> values;
 };
 
 bool checkMaterialsHaveTextures(const QHash<QString, HFMMaterial>& materials,
-        const QHash<QString, QByteArray>& textureFilenames, const QMultiMap<QString, QString>& _connectionChildMap) {
+        const QHash<QString, hifi::ByteArray>& textureFilenames, const QMultiMap<QString, QString>& _connectionChildMap) {
     foreach (const QString& materialID, materials.keys()) {
         foreach (const QString& childID, _connectionChildMap.values(materialID)) {
             if (textureFilenames.contains(childID)) {
@@ -389,7 +400,7 @@ HFMLight extractLight(const FBXNode& object) {
     return light;
 }
 
-QByteArray fileOnUrl(const QByteArray& filepath, const QString& url) {
+hifi::ByteArray fileOnUrl(const hifi::ByteArray& filepath, const QString& url) {
     // in order to match the behaviour when loading models from remote URLs
     // we assume that all external textures are right beside the loaded model
     // ignoring any relative paths or absolute paths inside of models
@@ -397,45 +408,10 @@ QByteArray fileOnUrl(const QByteArray& filepath, const QString& url) {
     return filepath.mid(filepath.lastIndexOf('/') + 1);
 }
 
-QMap<QString, QString> getJointNameMapping(const QVariantHash& mapping) {
-    static const QString JOINT_NAME_MAPPING_FIELD = "jointMap";
-    QMap<QString, QString> hfmToHifiJointNameMap;
-    if (!mapping.isEmpty() && mapping.contains(JOINT_NAME_MAPPING_FIELD) && mapping[JOINT_NAME_MAPPING_FIELD].type() == QVariant::Hash) {
-        auto jointNames = mapping[JOINT_NAME_MAPPING_FIELD].toHash();
-        for (auto itr = jointNames.begin(); itr != jointNames.end(); itr++) {
-            hfmToHifiJointNameMap.insert(itr.key(), itr.value().toString());
-            qCDebug(modelformat) << "the mapped key " << itr.key() << " has a value of " << hfmToHifiJointNameMap[itr.key()];
-        }
-    }
-    return hfmToHifiJointNameMap;
-}
-
-QMap<QString, glm::quat> getJointRotationOffsets(const QVariantHash& mapping) {
-    QMap<QString, glm::quat> jointRotationOffsets;
-    static const QString JOINT_ROTATION_OFFSET_FIELD = "jointRotationOffset";
-    if (!mapping.isEmpty() && mapping.contains(JOINT_ROTATION_OFFSET_FIELD) && mapping[JOINT_ROTATION_OFFSET_FIELD].type() == QVariant::Hash) {
-        auto offsets = mapping[JOINT_ROTATION_OFFSET_FIELD].toHash();
-        for (auto itr = offsets.begin(); itr != offsets.end(); itr++) {
-            QString jointName = itr.key();
-            QString line = itr.value().toString();
-            auto quatCoords = line.split(',');
-            if (quatCoords.size() == 4) {
-                float quatX = quatCoords[0].mid(1).toFloat();
-                float quatY = quatCoords[1].toFloat();
-                float quatZ = quatCoords[2].toFloat();
-                float quatW = quatCoords[3].mid(0, quatCoords[3].size() - 1).toFloat();
-                if (!isNaN(quatX) && !isNaN(quatY) && !isNaN(quatZ) && !isNaN(quatW)) {
-                    glm::quat rotationOffset = glm::quat(quatW, quatX, quatY, quatZ);
-                    jointRotationOffsets.insert(jointName, rotationOffset);
-                }
-            }
-        }
-    }
-    return jointRotationOffsets;
-}
-
-HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QString& url) {
+HFMModel* FBXSerializer::extractHFMModel(const hifi::VariantHash& mapping, const QString& url) {
     const FBXNode& node = _rootNode;
+    bool deduplicateIndices = mapping["deduplicateIndices"].toBool();
+
     QMap<QString, ExtractedMesh> meshes;
     QHash<QString, QString> modelIDsToNames;
     QHash<QString, int> meshIDsToMeshIndices;
@@ -444,7 +420,7 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
     QVector<ExtractedBlendshape> blendshapes;
 
     QHash<QString, FBXModel> fbxModels;
-    QHash<QString, Cluster> clusters; 
+    QHash<QString, Cluster> fbxClusters; 
     QHash<QString, AnimationCurve> animationCurves;
 
     QHash<QString, QString> typeFlags;
@@ -457,13 +433,11 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
 
     std::map<QString, HFMLight> lights;
 
-    QVariantHash joints = mapping.value("joint").toHash();
+    hifi::VariantHash blendshapeMappings = mapping.value("bs").toHash();
 
-    QVariantHash blendshapeMappings = mapping.value("bs").toHash();
-
-    QMultiHash<QByteArray, WeightedIndex> blendshapeIndices;
+    QMultiHash<hifi::ByteArray, WeightedIndex> blendshapeIndices;
     for (int i = 0;; i++) {
-        QByteArray blendshapeName = FACESHIFT_BLENDSHAPES[i];
+        hifi::ByteArray blendshapeName = FACESHIFT_BLENDSHAPES[i];
         if (blendshapeName.isEmpty()) {
             break;
         }
@@ -486,14 +460,15 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
     HFMModel& hfmModel = *hfmModelPtr;
 
     hfmModel.originalURL = url;
-    hfmModel.hfmToHifiJointNameMapping.clear();
-    hfmModel.hfmToHifiJointNameMapping = getJointNameMapping(mapping);
 
     float unitScaleFactor = 1.0f;
+    glm::quat upAxisZRotation;
+    bool applyUpAxisZRotation = false;
     glm::vec3 ambientColor;
     QString hifiGlobalNodeID;
     unsigned int meshIndex = 0;
     haveReportedUnhandledRotationOrder = false;
+    int fbxVersionNumber = -1;
     foreach (const FBXNode& child, node.children) {
 
         if (child.name == "FBXHeaderExtension") {
@@ -508,7 +483,7 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                             }
                         } else if (subobject.name == "Properties70") {
                             foreach (const FBXNode& subsubobject, subobject.children) {
-                                static const QVariant APPLICATION_NAME = QVariant(QByteArray("Original|ApplicationName"));
+                                static const QVariant APPLICATION_NAME = QVariant(hifi::ByteArray("Original|ApplicationName"));
                                 if (subsubobject.name == "P" && subsubobject.properties.size() >= 5 &&
                                         subsubobject.properties.at(0) == APPLICATION_NAME) {
                                     hfmModel.applicationName = subsubobject.properties.at(4).toString();
@@ -516,6 +491,8 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                             }
                         }
                     }
+                } else if (object.name == "FBXVersion") {
+                    fbxVersionNumber = object.properties.at(0).toInt();
                 }
             }
         } else if (child.name == "GlobalSettings") {
@@ -525,13 +502,24 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                     int index = 4;
                     foreach (const FBXNode& subobject, object.children) {
                         if (subobject.name == propertyName) {
-                            static const QVariant UNIT_SCALE_FACTOR = QByteArray("UnitScaleFactor");
-                            static const QVariant AMBIENT_COLOR = QByteArray("AmbientColor");
+                            static const QVariant UNIT_SCALE_FACTOR = hifi::ByteArray("UnitScaleFactor");
+                            static const QVariant AMBIENT_COLOR = hifi::ByteArray("AmbientColor");
+                            static const QVariant UP_AXIS = hifi::ByteArray("UpAxis");
                             const auto& subpropName = subobject.properties.at(0);
                             if (subpropName == UNIT_SCALE_FACTOR) {
                                 unitScaleFactor = subobject.properties.at(index).toFloat();
                             } else if (subpropName == AMBIENT_COLOR) {
                                 ambientColor = getVec3(subobject.properties, index);
+                            } else if (subpropName == UP_AXIS) {
+                                constexpr int UP_AXIS_Y = 1;
+                                constexpr int UP_AXIS_Z = 2;
+                                int upAxis = subobject.properties.at(index).toInt();
+                                if (upAxis == UP_AXIS_Y) {
+                                    // No update necessary, y up is the default
+                                } else if (upAxis == UP_AXIS_Z) {
+                                    upAxisZRotation = glm::angleAxis(glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+                                    applyUpAxisZRotation = true;
+                                }
                             }
                         }
                     }
@@ -541,13 +529,13 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
             foreach (const FBXNode& object, child.children) {
                 if (object.name == "Geometry") {
                     if (object.properties.at(2) == "Mesh") {
-                        meshes.insert(getID(object.properties), extractMesh(object, meshIndex));
+                        meshes.insert(getID(object.properties), extractMesh(object, meshIndex, deduplicateIndices));
                     } else { // object.properties.at(2) == "Shape"
-                        ExtractedBlendshape extracted = { getID(object.properties), extractBlendshape(object) };
-                        blendshapes.append(extracted);
+                        ExtractedBlendshape blendshape = { getID(object.properties), extractBlendshape(object) };
+                        blendshapes.append(blendshape);
                     }
                 } else if (object.name == "Model") {
-                    QString name = getName(object.properties);
+                    QString name = getModelName(object.properties);
                     QString id = getID(object.properties);
                     modelIDsToNames.insert(id, name);
 
@@ -573,14 +561,16 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                     glm::vec3 geometricRotation;
 
                     glm::vec3 rotationMin, rotationMax;
+
+                    bool isLimbNode = object.properties.size() >= 3 && object.properties.at(2) == "LimbNode";
                     FBXModel fbxModel = { name, -1, glm::vec3(), glm::mat4(), glm::quat(), glm::quat(), glm::quat(),
-                                       glm::mat4(), glm::vec3(), glm::vec3(),
-                                       false, glm::vec3(), glm::quat(), glm::vec3(1.0f) };
+                                          glm::mat4(), glm::vec3(), glm::vec3(),
+                                          false, glm::vec3(), glm::quat(), glm::vec3(1.0f), isLimbNode };
                     ExtractedMesh* mesh = NULL;
                     QVector<ExtractedBlendshape> blendshapes;
                     foreach (const FBXNode& subobject, object.children) {
                         bool properties = false;
-                        QByteArray propertyName;
+                        hifi::ByteArray propertyName;
                         int index;
                         if (subobject.name == "Properties60") {
                             properties = true;
@@ -593,27 +583,27 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                             index = 4;
                         }
                         if (properties) {
-                            static const QVariant ROTATION_ORDER = QByteArray("RotationOrder");
-                            static const QVariant GEOMETRIC_TRANSLATION = QByteArray("GeometricTranslation");
-                            static const QVariant GEOMETRIC_ROTATION = QByteArray("GeometricRotation");
-                            static const QVariant GEOMETRIC_SCALING = QByteArray("GeometricScaling");
-                            static const QVariant LCL_TRANSLATION = QByteArray("Lcl Translation");
-                            static const QVariant LCL_ROTATION = QByteArray("Lcl Rotation");
-                            static const QVariant LCL_SCALING = QByteArray("Lcl Scaling");
-                            static const QVariant ROTATION_MAX = QByteArray("RotationMax");
-                            static const QVariant ROTATION_MAX_X = QByteArray("RotationMaxX");
-                            static const QVariant ROTATION_MAX_Y = QByteArray("RotationMaxY");
-                            static const QVariant ROTATION_MAX_Z = QByteArray("RotationMaxZ");
-                            static const QVariant ROTATION_MIN = QByteArray("RotationMin");
-                            static const QVariant ROTATION_MIN_X = QByteArray("RotationMinX");
-                            static const QVariant ROTATION_MIN_Y = QByteArray("RotationMinY");
-                            static const QVariant ROTATION_MIN_Z = QByteArray("RotationMinZ");
-                            static const QVariant ROTATION_OFFSET = QByteArray("RotationOffset");
-                            static const QVariant ROTATION_PIVOT = QByteArray("RotationPivot");
-                            static const QVariant SCALING_OFFSET = QByteArray("ScalingOffset");
-                            static const QVariant SCALING_PIVOT = QByteArray("ScalingPivot");
-                            static const QVariant PRE_ROTATION = QByteArray("PreRotation");
-                            static const QVariant POST_ROTATION = QByteArray("PostRotation");
+                            static const QVariant ROTATION_ORDER = hifi::ByteArray("RotationOrder");
+                            static const QVariant GEOMETRIC_TRANSLATION = hifi::ByteArray("GeometricTranslation");
+                            static const QVariant GEOMETRIC_ROTATION = hifi::ByteArray("GeometricRotation");
+                            static const QVariant GEOMETRIC_SCALING = hifi::ByteArray("GeometricScaling");
+                            static const QVariant LCL_TRANSLATION = hifi::ByteArray("Lcl Translation");
+                            static const QVariant LCL_ROTATION = hifi::ByteArray("Lcl Rotation");
+                            static const QVariant LCL_SCALING = hifi::ByteArray("Lcl Scaling");
+                            static const QVariant ROTATION_MAX = hifi::ByteArray("RotationMax");
+                            static const QVariant ROTATION_MAX_X = hifi::ByteArray("RotationMaxX");
+                            static const QVariant ROTATION_MAX_Y = hifi::ByteArray("RotationMaxY");
+                            static const QVariant ROTATION_MAX_Z = hifi::ByteArray("RotationMaxZ");
+                            static const QVariant ROTATION_MIN = hifi::ByteArray("RotationMin");
+                            static const QVariant ROTATION_MIN_X = hifi::ByteArray("RotationMinX");
+                            static const QVariant ROTATION_MIN_Y = hifi::ByteArray("RotationMinY");
+                            static const QVariant ROTATION_MIN_Z = hifi::ByteArray("RotationMinZ");
+                            static const QVariant ROTATION_OFFSET = hifi::ByteArray("RotationOffset");
+                            static const QVariant ROTATION_PIVOT = hifi::ByteArray("RotationPivot");
+                            static const QVariant SCALING_OFFSET = hifi::ByteArray("ScalingOffset");
+                            static const QVariant SCALING_PIVOT = hifi::ByteArray("ScalingPivot");
+                            static const QVariant PRE_ROTATION = hifi::ByteArray("PreRotation");
+                            static const QVariant POST_ROTATION = hifi::ByteArray("PostRotation");
                             foreach(const FBXNode& property, subobject.children) {
                                 const auto& childProperty = property.properties.at(0);
                                 if (property.name == propertyName) {
@@ -683,10 +673,10 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                                     }
                                 }
                             }
-                        } else if (subobject.name == "Vertices") {
+                        } else if (subobject.name == "Vertices" || subobject.name == "DracoMesh") {
                             // it's a mesh as well as a model
                             mesh = &meshes[getID(object.properties)];
-                            *mesh = extractMesh(object, meshIndex);
+                            *mesh = extractMesh(object, meshIndex, deduplicateIndices);
 
                         } else if (subobject.name == "Shape") {
                             ExtractedBlendshape blendshape =  { subobject.properties.at(0).toString(),
@@ -716,8 +706,8 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
 
                     // add the blendshapes included in the model, if any
                     if (mesh) {
-                        foreach (const ExtractedBlendshape& extracted, blendshapes) {
-                            addBlendshapes(extracted, blendshapeIndices.values(extracted.id.toLatin1()), *mesh);
+                        foreach (const ExtractedBlendshape& blendshape, blendshapes) {
+                            addBlendshapes(blendshape, blendshapeIndices.values(blendshape.id.toLatin1()), *mesh);
                         }
                     }
 
@@ -753,8 +743,8 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                         const int MODEL_UV_SCALING_MIN_SIZE = 2;
                         const int CROPPING_MIN_SIZE = 4;
                         if (subobject.name == "RelativeFilename" && subobject.properties.length() >= RELATIVE_FILENAME_MIN_SIZE) {
-                            QByteArray filename = subobject.properties.at(0).toByteArray();
-                            QByteArray filepath = filename.replace('\\', '/');
+                            hifi::ByteArray filename = subobject.properties.at(0).toByteArray();
+                            hifi::ByteArray filepath = filename.replace('\\', '/');
                             filename = fileOnUrl(filepath, url);
                             _textureFilepaths.insert(getID(object.properties), filepath);
                             _textureFilenames.insert(getID(object.properties), filename);
@@ -766,34 +756,34 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                         } else if (subobject.name == "Texture_Alpha_Source" && subobject.properties.length() >= TEXTURE_ALPHA_SOURCE_MIN_SIZE) {
                             tex.assign<uint8_t>(tex.alphaSource, subobject.properties.at(0).value<int>());
                         } else if (subobject.name == "ModelUVTranslation" && subobject.properties.length() >= MODEL_UV_TRANSLATION_MIN_SIZE) {
-                            tex.assign(tex.UVTranslation, glm::vec2(subobject.properties.at(0).value<double>(),
-                                                                    subobject.properties.at(1).value<double>()));
+                            auto newTranslation = glm::vec3(subobject.properties.at(0).value<double>(), subobject.properties.at(1).value<double>(), 0.0);
+                            tex.assign(tex.translation, tex.translation + newTranslation);
                         } else if (subobject.name == "ModelUVScaling" && subobject.properties.length() >= MODEL_UV_SCALING_MIN_SIZE) {
-                            tex.assign(tex.UVScaling, glm::vec2(subobject.properties.at(0).value<double>(),
-                                                                subobject.properties.at(1).value<double>()));
-                            if (tex.UVScaling.x == 0.0f) {
-                                tex.UVScaling.x = 1.0f;
+                            auto newScaling = glm::vec3(subobject.properties.at(0).value<double>(), subobject.properties.at(1).value<double>(), 1.0);
+                            if (newScaling.x == 0.0f) {
+                                newScaling.x = 1.0f;
                             }
-                            if (tex.UVScaling.y == 0.0f) {
-                                tex.UVScaling.y = 1.0f;
+                            if (newScaling.y == 0.0f) {
+                                newScaling.y = 1.0f;
                             }
+                            tex.assign(tex.scaling, tex.scaling * newScaling);
                         } else if (subobject.name == "Cropping" && subobject.properties.length() >= CROPPING_MIN_SIZE) {
                             tex.assign(tex.cropping, glm::vec4(subobject.properties.at(0).value<int>(),
                                                                 subobject.properties.at(1).value<int>(),
                                                                 subobject.properties.at(2).value<int>(),
                                                                 subobject.properties.at(3).value<int>()));
                         } else if (subobject.name == "Properties70") {
-                            QByteArray propertyName;
+                            hifi::ByteArray propertyName;
                             int index;
                                 propertyName = "P";
                                 index = 4;
                                 foreach (const FBXNode& property, subobject.children) {
-                                    static const QVariant UV_SET = QByteArray("UVSet");
-                                    static const QVariant CURRENT_TEXTURE_BLEND_MODE = QByteArray("CurrentTextureBlendMode");
-                                    static const QVariant USE_MATERIAL = QByteArray("UseMaterial");
-                                    static const QVariant TRANSLATION = QByteArray("Translation");
-                                    static const QVariant ROTATION = QByteArray("Rotation");
-                                    static const QVariant SCALING = QByteArray("Scaling");
+                                    static const QVariant UV_SET = hifi::ByteArray("UVSet");
+                                    static const QVariant CURRENT_TEXTURE_BLEND_MODE = hifi::ByteArray("CurrentTextureBlendMode");
+                                    static const QVariant USE_MATERIAL = hifi::ByteArray("UseMaterial");
+                                    static const QVariant TRANSLATION = hifi::ByteArray("Translation");
+                                    static const QVariant ROTATION = hifi::ByteArray("Rotation");
+                                    static const QVariant SCALING = hifi::ByteArray("Scaling");
                                     if (property.name == propertyName) {
                                         QString v = property.properties.at(0).toString();
                                         if (property.properties.at(0) == UV_SET) {
@@ -804,20 +794,21 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                                         } else if (property.properties.at(0) == USE_MATERIAL) {
                                             tex.assign<bool>(tex.useMaterial, property.properties.at(index).value<int>());
                                         } else if (property.properties.at(0) == TRANSLATION) {
-                                            tex.assign(tex.translation, getVec3(property.properties, index));
+                                            tex.assign(tex.translation, tex.translation + getVec3(property.properties, index));
                                         } else if (property.properties.at(0) == ROTATION) {
                                             tex.assign(tex.rotation, getVec3(property.properties, index));
                                         } else if (property.properties.at(0) == SCALING) {
-                                            tex.assign(tex.scaling, getVec3(property.properties, index));
-                                            if (tex.scaling.x == 0.0f) {
-                                                tex.scaling.x = 1.0f;
+                                            auto newScaling = getVec3(property.properties, index);
+                                            if (newScaling.x == 0.0f) {
+                                                newScaling.x = 1.0f;
                                             }
-                                            if (tex.scaling.y == 0.0f) {
-                                                tex.scaling.y = 1.0f;
+                                            if (newScaling.y == 0.0f) {
+                                                newScaling.y = 1.0f;
                                             }
-                                            if (tex.scaling.z == 0.0f) {
-                                                tex.scaling.z = 1.0f;
+                                            if (newScaling.z == 0.0f) {
+                                                newScaling.z = 1.0f;
                                             }
+                                            tex.assign(tex.scaling, tex.scaling * newScaling);
                                         }
 #if defined(DEBUG_FBXSERIALIZER)
                                         else {
@@ -846,8 +837,8 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                         _textureParams.insert(getID(object.properties), tex);
                     }
                 } else if (object.name == "Video") {
-                    QByteArray filepath;
-                    QByteArray content;
+                    hifi::ByteArray filepath;
+                    hifi::ByteArray content;
                     foreach (const FBXNode& subobject, object.children) {
                         if (subobject.name == "RelativeFilename") {
                             filepath = subobject.properties.at(0).toByteArray();
@@ -862,11 +853,12 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                     }
                 } else if (object.name == "Material") {
                     HFMMaterial material;
-                    material.name = (object.properties.at(1).toString());
+                    MaterialParam materialParam;
+                    material.name = getMaterialName(object.properties);
                     foreach (const FBXNode& subobject, object.children) {
                         bool properties = false;
 
-                        QByteArray propertyName;
+                        hifi::ByteArray propertyName;
                         int index;
                         if (subobject.name == "Properties60") {
                             properties = true;
@@ -883,29 +875,33 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
 
                         if (properties) {
                             std::vector<std::string> unknowns;
-                            static const QVariant DIFFUSE_COLOR = QByteArray("DiffuseColor");
-                            static const QVariant DIFFUSE_FACTOR = QByteArray("DiffuseFactor");
-                            static const QVariant DIFFUSE = QByteArray("Diffuse");
-                            static const QVariant SPECULAR_COLOR = QByteArray("SpecularColor");
-                            static const QVariant SPECULAR_FACTOR = QByteArray("SpecularFactor");
-                            static const QVariant SPECULAR = QByteArray("Specular");
-                            static const QVariant EMISSIVE_COLOR = QByteArray("EmissiveColor");
-                            static const QVariant EMISSIVE_FACTOR = QByteArray("EmissiveFactor");
-                            static const QVariant EMISSIVE = QByteArray("Emissive");
-                            static const QVariant AMBIENT_FACTOR = QByteArray("AmbientFactor");
-                            static const QVariant SHININESS = QByteArray("Shininess");
-                            static const QVariant OPACITY = QByteArray("Opacity");
-                            static const QVariant MAYA_USE_NORMAL_MAP = QByteArray("Maya|use_normal_map");
-                            static const QVariant MAYA_BASE_COLOR = QByteArray("Maya|base_color");
-                            static const QVariant MAYA_USE_COLOR_MAP = QByteArray("Maya|use_color_map");
-                            static const QVariant MAYA_ROUGHNESS = QByteArray("Maya|roughness");
-                            static const QVariant MAYA_USE_ROUGHNESS_MAP = QByteArray("Maya|use_roughness_map");
-                            static const QVariant MAYA_METALLIC = QByteArray("Maya|metallic");
-                            static const QVariant MAYA_USE_METALLIC_MAP = QByteArray("Maya|use_metallic_map");
-                            static const QVariant MAYA_EMISSIVE = QByteArray("Maya|emissive");
-                            static const QVariant MAYA_EMISSIVE_INTENSITY = QByteArray("Maya|emissive_intensity");
-                            static const QVariant MAYA_USE_EMISSIVE_MAP = QByteArray("Maya|use_emissive_map");
-                            static const QVariant MAYA_USE_AO_MAP = QByteArray("Maya|use_ao_map");
+                            static const QVariant DIFFUSE_COLOR = hifi::ByteArray("DiffuseColor");
+                            static const QVariant DIFFUSE_FACTOR = hifi::ByteArray("DiffuseFactor");
+                            static const QVariant DIFFUSE = hifi::ByteArray("Diffuse");
+                            static const QVariant SPECULAR_COLOR = hifi::ByteArray("SpecularColor");
+                            static const QVariant SPECULAR_FACTOR = hifi::ByteArray("SpecularFactor");
+                            static const QVariant SPECULAR = hifi::ByteArray("Specular");
+                            static const QVariant EMISSIVE_COLOR = hifi::ByteArray("EmissiveColor");
+                            static const QVariant EMISSIVE_FACTOR = hifi::ByteArray("EmissiveFactor");
+                            static const QVariant EMISSIVE = hifi::ByteArray("Emissive");
+                            static const QVariant AMBIENT_FACTOR = hifi::ByteArray("AmbientFactor");
+                            static const QVariant SHININESS = hifi::ByteArray("Shininess");
+                            static const QVariant OPACITY = hifi::ByteArray("Opacity");
+                            static const QVariant MAYA_USE_NORMAL_MAP = hifi::ByteArray("Maya|use_normal_map");
+                            static const QVariant MAYA_BASE_COLOR = hifi::ByteArray("Maya|base_color");
+                            static const QVariant MAYA_USE_COLOR_MAP = hifi::ByteArray("Maya|use_color_map");
+                            static const QVariant MAYA_ROUGHNESS = hifi::ByteArray("Maya|roughness");
+                            static const QVariant MAYA_USE_ROUGHNESS_MAP = hifi::ByteArray("Maya|use_roughness_map");
+                            static const QVariant MAYA_METALLIC = hifi::ByteArray("Maya|metallic");
+                            static const QVariant MAYA_USE_METALLIC_MAP = hifi::ByteArray("Maya|use_metallic_map");
+                            static const QVariant MAYA_EMISSIVE = hifi::ByteArray("Maya|emissive");
+                            static const QVariant MAYA_EMISSIVE_INTENSITY = hifi::ByteArray("Maya|emissive_intensity");
+                            static const QVariant MAYA_USE_EMISSIVE_MAP = hifi::ByteArray("Maya|use_emissive_map");
+                            static const QVariant MAYA_USE_AO_MAP = hifi::ByteArray("Maya|use_ao_map");
+                            static const QVariant MAYA_UV_SCALE = hifi::ByteArray("Maya|uv_scale");
+                            static const QVariant MAYA_UV_OFFSET = hifi::ByteArray("Maya|uv_offset");
+                            static const int MAYA_UV_OFFSET_PROPERTY_LENGTH = 6;
+                            static const int MAYA_UV_SCALE_PROPERTY_LENGTH = 6;
 
 
 
@@ -994,6 +990,27 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                                         material.isPBSMaterial = true;
                                         material.useOcclusionMap = (bool)property.properties.at(index).value<double>();
 
+                                    } else if (property.properties.at(0) == MAYA_UV_SCALE) {
+                                        if (property.properties.size() == MAYA_UV_SCALE_PROPERTY_LENGTH) {
+                                            // properties: { "Maya|uv_scale", "Vector2D", "Vector2", nothing, double, double }
+                                            glm::vec3 scale = glm::vec3(property.properties.at(4).value<double>(), property.properties.at(5).value<double>(), 1.0);
+                                            if (scale.x == 0.0f) {
+                                                scale.x = 1.0f;
+                                            }
+                                            if (scale.y == 0.0f) {
+                                                scale.y = 1.0f;
+                                            }
+                                            if (scale.z == 0.0f) {
+                                                scale.z = 1.0f;
+                                            }
+                                            materialParam.scaling *= scale;
+                                        }
+                                    } else if (property.properties.at(0) == MAYA_UV_OFFSET) {
+                                        if (property.properties.size() == MAYA_UV_OFFSET_PROPERTY_LENGTH) {
+                                            // properties: { "Maya|uv_offset", "Vector2D", "Vector2", nothing, double, double }
+                                            glm::vec3 translation = glm::vec3(property.properties.at(4).value<double>(), property.properties.at(5).value<double>(), 1.0);
+                                            materialParam.translation += translation;
+                                        }
                                     } else {
                                         const QString propname = property.properties.at(0).toString();
                                         unknowns.push_back(propname.toStdString());
@@ -1015,6 +1032,7 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                     }
                     material.materialID = getID(object.properties);
                     _hfmMaterials.insert(material.materialID, material);
+                    _materialParams.insert(material.materialID, materialParam);
 
 
                 } else if (object.name == "NodeAttribute") {
@@ -1055,10 +1073,14 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                                 cluster.transformLink = createMat4(values);
                             }
                         }
-                        clusters.insert(getID(object.properties), cluster);
+
+                        // skip empty fbxClusters
+                        if (cluster.indices.size() > 0 && cluster.weights.size() > 0) {
+                            fbxClusters.insert(getID(object.properties), cluster);
+                        }
 
                     } else if (object.properties.last() == "BlendShapeChannel") {
-                        QByteArray name = object.properties.at(1).toByteArray();
+                        hifi::ByteArray name = object.properties.at(1).toByteArray();
 
                         name = name.left(name.indexOf('\0'));
                         if (!blendshapeIndices.contains(name)) {
@@ -1095,8 +1117,8 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
 #endif
             }
         } else if (child.name == "Connections") {
-            static const QVariant OO = QByteArray("OO");
-            static const QVariant OP = QByteArray("OP");
+            static const QVariant OO = hifi::ByteArray("OO");
+            static const QVariant OP = hifi::ByteArray("OP");
             foreach (const FBXNode& connection, child.children) {
                 if (connection.name == "C" || connection.name == "Connect") {
                     if (connection.properties.at(0) == OO) {
@@ -1115,7 +1137,7 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                         }
                     } else if (connection.properties.at(0) == OP) {
                         int counter = 0;
-                        QByteArray type = connection.properties.at(3).toByteArray().toLower();
+                        hifi::ByteArray type = connection.properties.at(3).toByteArray().toLower();
                         if (type.contains("DiffuseFactor")) {
                             diffuseFactorTextures.insert(getID(connection.properties, 2), getID(connection.properties, 1));
                         } else if ((type.contains("diffuse") && !type.contains("tex_global_diffuse"))) {
@@ -1167,8 +1189,14 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                             counter++;
                         }
                     }
-                    _connectionParentMap.insert(getID(connection.properties, 1), getID(connection.properties, 2));
-                    _connectionChildMap.insert(getID(connection.properties, 2), getID(connection.properties, 1));
+                    if (_connectionParentMap.value(getID(connection.properties, 1)) == "0") {
+                        // don't assign the new parent
+                        qCDebug(modelformat) << "root node " << getID(connection.properties, 1) << "  has discarded parent " << getID(connection.properties, 2);
+                        _connectionChildMap.insert(getID(connection.properties, 2), getID(connection.properties, 1));
+                    } else {
+                        _connectionParentMap.insert(getID(connection.properties, 1), getID(connection.properties, 2));
+                        _connectionChildMap.insert(getID(connection.properties, 2), getID(connection.properties, 1));
+                    }
                 }
             }
         }
@@ -1202,11 +1230,11 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
     }
 
     // assign the blendshapes to their corresponding meshes
-    foreach (const ExtractedBlendshape& extracted, blendshapes) {
-        QString blendshapeChannelID = _connectionParentMap.value(extracted.id);
+    foreach (const ExtractedBlendshape& blendshape, blendshapes) {
+        QString blendshapeChannelID = _connectionParentMap.value(blendshape.id);
         QString blendshapeID = _connectionParentMap.value(blendshapeChannelID);
         QString meshID = _connectionParentMap.value(blendshapeID);
-        addBlendshapes(extracted, blendshapeChannelIndices.values(blendshapeChannelID), meshes[meshID]);
+        addBlendshapes(blendshape, blendshapeChannelIndices.values(blendshapeChannelID), meshes[meshID]);
     }
 
     // get offset transform from mapping
@@ -1221,13 +1249,13 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
     QVector<QString> modelIDs;
     QSet<QString> remainingFBXModels;
     for (QHash<QString, FBXModel>::const_iterator fbxModel = fbxModels.constBegin(); fbxModel != fbxModels.constEnd(); fbxModel++) {
-        // models with clusters must be parented to the cluster top
+        // models with fbxClusters must be parented to the cluster top
         // Unless the model is a root node.
         bool isARootNode = !modelIDs.contains(_connectionParentMap.value(fbxModel.key()));
         if (!isARootNode) {  
             foreach(const QString& deformerID, _connectionChildMap.values(fbxModel.key())) {
                 foreach(const QString& clusterID, _connectionChildMap.values(deformerID)) {
-                    if (!clusters.contains(clusterID)) {
+                    if (!fbxClusters.contains(clusterID)) {
                         continue;
                     }
                     QString topID = getTopModelID(_connectionParentMap, fbxModels, _connectionChildMap.value(clusterID), url);
@@ -1270,25 +1298,20 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
     }
 
     // convert the models to joints
-    QVariantList freeJoints = mapping.values("freeJoint");
     hfmModel.hasSkeletonJoints = false;
-    foreach (const QString& modelID, modelIDs) {
+    
+    bool needMixamoHack = hfmModel.applicationName == "mixamo.com";
+
+    std::vector<glm::mat4> transformForClusters;
+    transformForClusters.reserve((size_t)modelIDs.size());
+    for (const QString& modelID : modelIDs) {
         const FBXModel& fbxModel = fbxModels[modelID];
         HFMJoint joint;
-        joint.isFree = freeJoints.contains(fbxModel.name);
         joint.parentIndex = fbxModel.parentIndex;
+        uint32_t jointIndex = (uint32_t)hfmModel.joints.size();
 
-        // get the indices of all ancestors starting with the first free one (if any)
-        int jointIndex = hfmModel.joints.size();
-        joint.freeLineage.append(jointIndex);
-        int lastFreeIndex = joint.isFree ? 0 : -1;
-        for (int index = joint.parentIndex; index != -1; index = hfmModel.joints.at(index).parentIndex) {
-            if (hfmModel.joints.at(index).isFree) {
-                lastFreeIndex = joint.freeLineage.size();
-            }
-            joint.freeLineage.append(index);
-        }
-        joint.freeLineage.remove(lastFreeIndex + 1, joint.freeLineage.size() - lastFreeIndex - 1);
+        // Copy default joint parameters from model
+
         joint.translation = fbxModel.translation; // these are usually in centimeters
         joint.preTransform = fbxModel.preTransform;
         joint.preRotation = fbxModel.preRotation;
@@ -1298,45 +1321,62 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
         joint.rotationMin = fbxModel.rotationMin;
         joint.rotationMax = fbxModel.rotationMax;
 
-        joint.hasGeometricOffset = fbxModel.hasGeometricOffset;
-        joint.geometricTranslation = fbxModel.geometricTranslation;
-        joint.geometricRotation = fbxModel.geometricRotation;
-        joint.geometricScaling = fbxModel.geometricScaling;
-
-        glm::quat combinedRotation = joint.preRotation * joint.rotation * joint.postRotation;
-
-        if (joint.parentIndex == -1) {
-            joint.transform = hfmModel.offset * glm::translate(joint.translation) * joint.preTransform *
-                glm::mat4_cast(combinedRotation) * joint.postTransform;
-            joint.inverseDefaultRotation = glm::inverse(combinedRotation);
-            joint.distanceToParent = 0.0f;
-
-        } else {
-            const HFMJoint& parentJoint = hfmModel.joints.at(joint.parentIndex);
-            joint.transform = parentJoint.transform * glm::translate(joint.translation) *
-                joint.preTransform * glm::mat4_cast(combinedRotation) * joint.postTransform;
-            joint.inverseDefaultRotation = glm::inverse(combinedRotation) * parentJoint.inverseDefaultRotation;
-            joint.distanceToParent = glm::distance(extractTranslation(parentJoint.transform),
-                extractTranslation(joint.transform));
+        if (fbxModel.hasGeometricOffset) {
+            joint.geometricOffset = createMatFromScaleQuatAndPos(fbxModel.geometricScaling, fbxModel.geometricRotation, fbxModel.geometricTranslation);
         }
-        joint.inverseBindRotation = joint.inverseDefaultRotation;
+        joint.isSkeletonJoint = fbxModel.isLimbNode;
+        hfmModel.hasSkeletonJoints = (hfmModel.hasSkeletonJoints || joint.isSkeletonJoint);
+
         joint.name = fbxModel.name;
-        if (hfmModel.hfmToHifiJointNameMapping.contains(hfmModel.hfmToHifiJointNameMapping.key(joint.name))) {
-            joint.name = hfmModel.hfmToHifiJointNameMapping.key(fbxModel.name);
-        }
-
-        foreach (const QString& childID, _connectionChildMap.values(modelID)) {
-            QString type = typeFlags.value(childID);
-            if (!type.isEmpty()) {
-                hfmModel.hasSkeletonJoints |= (joint.isSkeletonJoint = type.toLower().contains("Skeleton"));
-                break;
-            }
-        }
 
         joint.bindTransformFoundInCluster = false;
 
-        hfmModel.joints.append(joint);
-        hfmModel.jointIndices.insert(joint.name, hfmModel.joints.size());
+        // With the basic joint information, we can start to calculate compound transform information
+        // modelIDs is ordered from parent to children, so we can safely get parent transforms from earlier joints as we iterate
+
+        // Make adjustments to the static joint properties, and pre-calculate static transforms
+
+        if (applyUpAxisZRotation && joint.parentIndex == -1) {
+            joint.rotation *= upAxisZRotation;
+            joint.translation = upAxisZRotation * joint.translation;
+        }
+
+        glm::quat combinedRotation = joint.preRotation * joint.rotation * joint.postRotation;
+        joint.localTransform = glm::translate(joint.translation) * joint.preTransform * glm::mat4_cast(combinedRotation) * joint.postTransform;
+
+        if (joint.parentIndex == -1) {
+            joint.transform = joint.localTransform;
+            joint.globalTransform = hfmModel.offset * joint.localTransform;
+            joint.inverseDefaultRotation = glm::inverse(combinedRotation);
+            joint.distanceToParent = 0.0f;
+        } else {
+            const HFMJoint& parentJoint = hfmModel.joints.at(joint.parentIndex);
+            joint.transform = parentJoint.transform * joint.localTransform;
+            joint.globalTransform = parentJoint.globalTransform * joint.localTransform;
+            joint.inverseDefaultRotation = glm::inverse(combinedRotation) * parentJoint.inverseDefaultRotation;
+            joint.distanceToParent = glm::distance(extractTranslation(parentJoint.transform), extractTranslation(joint.transform));
+        }
+        joint.inverseBindRotation = joint.inverseDefaultRotation;
+
+        // If needed, separately calculate the FBX-specific transform used for inverse bind transform calculations
+
+        glm::mat4 transformForCluster;
+        if (applyUpAxisZRotation) {
+            const glm::quat jointBindCombinedRotation = fbxModel.preRotation * fbxModel.rotation * fbxModel.postRotation;
+            const glm::mat4 localTransformForCluster = glm::translate(fbxModel.translation) * fbxModel.preTransform * glm::mat4_cast(jointBindCombinedRotation) * fbxModel.postTransform;
+            if (fbxModel.parentIndex != -1 && fbxModel.parentIndex < (int)jointIndex && !needMixamoHack) {
+                const glm::mat4& parenttransformForCluster = transformForClusters[fbxModel.parentIndex];
+                transformForCluster = parenttransformForCluster * localTransformForCluster;
+            } else {
+                transformForCluster = localTransformForCluster;
+            }
+        } else {
+            transformForCluster = joint.transform;
+        }
+        transformForClusters.push_back(transformForCluster);
+
+        // Initialize animation information next
+        // And also get the joint poses from the first frame of the animation, if present
 
         QString rotationID = localRotations.value(modelID);
         AnimationCurve xRotCurve = animationCurves.value(xComponents.value(rotationID));
@@ -1360,18 +1400,20 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
                 xPosCurve.values.isEmpty() ? defaultPosValues.x : xPosCurve.values.at(i % xPosCurve.values.size()),
                 yPosCurve.values.isEmpty() ? defaultPosValues.y : yPosCurve.values.at(i % yPosCurve.values.size()),
                 zPosCurve.values.isEmpty() ? defaultPosValues.z : zPosCurve.values.at(i % zPosCurve.values.size()));
+            if ((fbxVersionNumber < 7500) && (i == 0)) {
+                joint.translation = hfmModel.animationFrames[i].translations[jointIndex];
+                joint.rotation = hfmModel.animationFrames[i].rotations[jointIndex];
+            }
         }
-    }
 
-    // NOTE: shapeVertices are in joint-frame
-    std::vector<ShapeVertices> shapeVertices;
-    shapeVertices.resize(std::max(1, hfmModel.joints.size()) );
+        hfmModel.joints.push_back(joint);
+    }
 
     hfmModel.bindExtents.reset();
     hfmModel.meshExtents.reset();
 
     // Create the Material Library
-    consolidateHFMMaterials(mapping);
+    consolidateHFMMaterials();
 
     // We can't allow the scaling of a given image to different sizes, because the hash used for the KTX cache is based on the original image
     // Allowing scaling of the same image to different sizes would cause different KTX files to target the same cache key
@@ -1404,301 +1446,203 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
         }
     }
 #endif
-    hfmModel.materials = _hfmMaterials;
+
+    std::unordered_map<std::string, uint32_t> materialNameToID; 
+    for (auto materialIt = _hfmMaterials.cbegin(); materialIt != _hfmMaterials.cend(); ++materialIt) {
+        materialNameToID[materialIt.key().toStdString()] = (uint32_t)hfmModel.materials.size();
+        hfmModel.materials.push_back(materialIt.value());
+    }
 
     // see if any materials have texture children
     bool materialsHaveTextures = checkMaterialsHaveTextures(_hfmMaterials, _textureFilenames, _connectionChildMap);
 
     for (QMap<QString, ExtractedMesh>::iterator it = meshes.begin(); it != meshes.end(); it++) {
-        ExtractedMesh& extracted = it.value();
+        const QString& meshID = it.key();
+        const ExtractedMesh& extracted = it.value();
+        const auto& partMaterialTextures = extracted.partMaterialTextures;
 
-        extracted.mesh.meshExtents.reset();
+        uint32_t meshIndex = (uint32_t)hfmModel.meshes.size();
+        meshIDsToMeshIndices.insert(meshID, meshIndex);
+        hfmModel.meshes.push_back(extracted.mesh);
+        hfm::Mesh& mesh = hfmModel.meshes.back();
 
-        // accumulate local transforms
-        QString modelID = fbxModels.contains(it.key()) ? it.key() : _connectionParentMap.value(it.key());
-        glm::mat4 modelTransform = getGlobalTransform(_connectionParentMap, fbxModels, modelID, hfmModel.applicationName == "mixamo.com", url);
-
-        // compute the mesh extents from the transformed vertices
-        foreach (const glm::vec3& vertex, extracted.mesh.vertices) {
-            glm::vec3 transformedVertex = glm::vec3(modelTransform * glm::vec4(vertex, 1.0f));
-            hfmModel.meshExtents.minimum = glm::min(hfmModel.meshExtents.minimum, transformedVertex);
-            hfmModel.meshExtents.maximum = glm::max(hfmModel.meshExtents.maximum, transformedVertex);
-
-            extracted.mesh.meshExtents.minimum = glm::min(extracted.mesh.meshExtents.minimum, transformedVertex);
-            extracted.mesh.meshExtents.maximum = glm::max(extracted.mesh.meshExtents.maximum, transformedVertex);
-            extracted.mesh.modelTransform = modelTransform;
-        }
-
-        // look for textures, material properties
-        // allocate the Part material library
-        int materialIndex = 0;
-        int textureIndex = 0;
-        bool generateTangents = false;
-        QList<QString> children = _connectionChildMap.values(modelID);
-        for (int i = children.size() - 1; i >= 0; i--) {
-
-            const QString& childID = children.at(i);
-            if (_hfmMaterials.contains(childID)) {
-                // the pure material associated with this part
-                HFMMaterial material = _hfmMaterials.value(childID);
-
-                for (int j = 0; j < extracted.partMaterialTextures.size(); j++) {
-                    if (extracted.partMaterialTextures.at(j).first == materialIndex) {
-                        HFMMeshPart& part = extracted.mesh.parts[j];
-                        part.materialID = material.materialID;
-                        generateTangents |= material.needTangentSpace();
-                    }
-                }
-
-                materialIndex++;
-
-            } else if (_textureFilenames.contains(childID)) {
-                HFMTexture texture = getTexture(childID);
-                for (int j = 0; j < extracted.partMaterialTextures.size(); j++) {
-                    int partTexture = extracted.partMaterialTextures.at(j).second;
-                    if (partTexture == textureIndex && !(partTexture == 0 && materialsHaveTextures)) {
-                        // TODO: DO something here that replaces this legacy code
-                        // Maybe create a material just for this part with the correct textures?
-                        // extracted.mesh.parts[j].diffuseTexture = texture;
-                    }
-                }
-                textureIndex++;
-            }
-        }
-
-        extracted.mesh.createMeshTangents(generateTangents);
-        extracted.mesh.createBlendShapeTangents(generateTangents);
-
-        // find the clusters with which the mesh is associated
-        QVector<QString> clusterIDs;
-        foreach (const QString& childID, _connectionChildMap.values(it.key())) {
-            foreach (const QString& clusterID, _connectionChildMap.values(childID)) {
-                if (!clusters.contains(clusterID)) {
-                    continue;
-                }
-                HFMCluster hfmCluster;
-                const Cluster& cluster = clusters[clusterID];
-                clusterIDs.append(clusterID);
-
-                // see http://stackoverflow.com/questions/13566608/loading-skinning-information-from-fbx for a discussion
-                // of skinning information in FBX
-                QString jointID = _connectionChildMap.value(clusterID);
-                hfmCluster.jointIndex = modelIDs.indexOf(jointID);
-                if (hfmCluster.jointIndex == -1) {
-                    qCDebug(modelformat) << "Joint not in model list: " << jointID;
-                    hfmCluster.jointIndex = 0;
-                }
-
-                hfmCluster.inverseBindMatrix = glm::inverse(cluster.transformLink) * modelTransform;
-
-                // slam bottom row to (0, 0, 0, 1), we KNOW this is not a perspective matrix and
-                // sometimes floating point fuzz can be introduced after the inverse.
-                hfmCluster.inverseBindMatrix[0][3] = 0.0f;
-                hfmCluster.inverseBindMatrix[1][3] = 0.0f;
-                hfmCluster.inverseBindMatrix[2][3] = 0.0f;
-                hfmCluster.inverseBindMatrix[3][3] = 1.0f;
-
-                hfmCluster.inverseBindTransform = Transform(hfmCluster.inverseBindMatrix);
-
-                extracted.mesh.clusters.append(hfmCluster);
-
-                // override the bind rotation with the transform link
-                HFMJoint& joint = hfmModel.joints[hfmCluster.jointIndex];
-                joint.inverseBindRotation = glm::inverse(extractRotation(cluster.transformLink));
-                joint.bindTransform = cluster.transformLink;
-                joint.bindTransformFoundInCluster = true;
-
-                // update the bind pose extents
-                glm::vec3 bindTranslation = extractTranslation(hfmModel.offset * joint.bindTransform);
-                hfmModel.bindExtents.addPoint(bindTranslation);
-            }
-        }
-
-        // if we don't have a skinned joint, parent to the model itself
-        if (extracted.mesh.clusters.isEmpty()) {
-            HFMCluster cluster;
-            cluster.jointIndex = modelIDs.indexOf(modelID);
-            if (cluster.jointIndex == -1) {
+        std::vector<QString> instanceModelIDs = getModelIDsForMeshID(meshID, fbxModels, _connectionParentMap);
+        // meshShapes will be added to hfmModel at the very end
+        std::vector<hfm::Shape> meshShapes;
+        meshShapes.reserve(instanceModelIDs.size() * mesh.parts.size());
+        for (const QString& modelID : instanceModelIDs) {
+            // The transform node has the same indexing order as the joints
+            int indexOfModelID = modelIDs.indexOf(modelID);
+            if (indexOfModelID == -1) {
                 qCDebug(modelformat) << "Model not in model list: " << modelID;
-                cluster.jointIndex = 0;
             }
-            extracted.mesh.clusters.append(cluster);
-        }
+            const uint32_t transformIndex = (indexOfModelID == -1) ? 0 : (uint32_t)indexOfModelID;
 
-        // whether we're skinned depends on how many clusters are attached
-        const HFMCluster& firstHFMCluster = extracted.mesh.clusters.at(0);
-        glm::mat4 inverseModelTransform = glm::inverse(modelTransform);
-        if (clusterIDs.size() > 1) {
-            // this is a multi-mesh joint
-            const int WEIGHTS_PER_VERTEX = 4;
-            int numClusterIndices = extracted.mesh.vertices.size() * WEIGHTS_PER_VERTEX;
-            extracted.mesh.clusterIndices.fill(0, numClusterIndices);
-            QVector<float> weightAccumulators;
-            weightAccumulators.fill(0.0f, numClusterIndices);
+            // partShapes will be added to meshShapes at the very end
+            std::vector<hfm::Shape> partShapes { mesh.parts.size() };
+            for (uint32_t i = 0; i < (uint32_t)partShapes.size(); ++i) {
+                hfm::Shape& shape = partShapes[i];
+                shape.mesh = meshIndex;
+                shape.meshPart = i;
+                shape.joint = transformIndex;
+            }
 
-            for (int i = 0; i < clusterIDs.size(); i++) {
-                QString clusterID = clusterIDs.at(i);
-                const Cluster& cluster = clusters[clusterID];
-                const HFMCluster& hfmCluster = extracted.mesh.clusters.at(i);
-                int jointIndex = hfmCluster.jointIndex;
-                HFMJoint& joint = hfmModel.joints[jointIndex];
-                glm::mat4 transformJointToMesh = inverseModelTransform * joint.bindTransform;
-                glm::vec3 boneEnd = extractTranslation(transformJointToMesh);
-                glm::vec3 boneBegin = boneEnd;
-                glm::vec3 boneDirection;
-                float boneLength = 0.0f;
-                if (joint.parentIndex != -1) {
-                    boneBegin = extractTranslation(inverseModelTransform * hfmModel.joints[joint.parentIndex].bindTransform);
-                    boneDirection = boneEnd - boneBegin;
-                    boneLength = glm::length(boneDirection);
-                    if (boneLength > EPSILON) {
-                        boneDirection /= boneLength;
+            // For FBX_DRACO_MESH_VERSION < 2, or unbaked models, get materials from the partMaterialTextures
+            if (!partMaterialTextures.empty()) {
+                int materialIndex = 0;
+                int textureIndex = 0;
+                QList<QString> children = _connectionChildMap.values(modelID);
+                for (int i = children.size() - 1; i >= 0; i--) {
+                    const QString& childID = children.at(i);
+                    if (_hfmMaterials.contains(childID)) {
+                        // the pure material associated with this part
+                        const HFMMaterial& material = _hfmMaterials.value(childID);
+                        for (int j = 0; j < partMaterialTextures.size(); j++) {
+                            if (partMaterialTextures.at(j).first == materialIndex) {
+                                hfm::Shape& shape = partShapes[j];
+                                shape.material = materialNameToID[material.materialID.toStdString()];
+                            }
+                        }
+                        materialIndex++;
+                    } else if (_textureFilenames.contains(childID)) {
+                        // NOTE (Sabrina 2019/01/11): getTextures now takes in the materialID as a second parameter, because FBX material nodes can sometimes have uv transform information (ex: "Maya|uv_scale")
+                        // I'm leaving the second parameter blank right now as this code may never be used.
+                        HFMTexture texture = getTexture(childID, "");
+                        for (int j = 0; j < partMaterialTextures.size(); j++) {
+                            int partTexture = partMaterialTextures.at(j).second;
+                            if (partTexture == textureIndex && !(partTexture == 0 && materialsHaveTextures)) {
+                                // TODO: DO something here that replaces this legacy code
+                                // Maybe create a material just for this part with the correct textures?
+                                // material.albedoTexture = texture;
+                                // partShapes[j].material = materialIndex;
+                            }
+                        }
+                        textureIndex++;
                     }
                 }
+            }
+            // For baked models with FBX_DRACO_MESH_VERSION >= 2, get materials from extracted.materialIDPerMeshPart
+            if (!extracted.materialIDPerMeshPart.empty()) {
+                assert(partShapes.size() == extracted.materialIDPerMeshPart.size());
+                for (uint32_t i = 0; i < (uint32_t)extracted.materialIDPerMeshPart.size(); ++i) {
+                    hfm::Shape& shape = partShapes[i];
+                    const std::string& materialID = extracted.materialIDPerMeshPart[i];
+                    auto materialIt = materialNameToID.find(materialID);
+                    if (materialIt != materialNameToID.end()) {
+                        shape.material = materialIt->second;
+                    }
+                }
+            }
 
-                glm::mat4 meshToJoint = glm::inverse(joint.bindTransform) * modelTransform;
-                ShapeVertices& points = shapeVertices.at(jointIndex);
+            // find the clusters with which the mesh is associated
+            QVector<QString> clusterIDs;
+            for (const QString& childID : _connectionChildMap.values(meshID)) {
+                for (const QString& clusterID : _connectionChildMap.values(childID)) {
+                    if (!fbxClusters.contains(clusterID)) {
+                        continue;
+                    }
+                    clusterIDs.append(clusterID);
+                }
+            }
 
-                for (int j = 0; j < cluster.indices.size(); j++) {
-                    int oldIndex = cluster.indices.at(j);
-                    float weight = cluster.weights.at(j);
-                    for (QMultiHash<int, int>::const_iterator it = extracted.newIndices.constFind(oldIndex);
+            // whether we're skinned depends on how many clusters are attached
+            if (clusterIDs.size() > 0) {
+                hfm::SkinDeformer skinDeformer;
+                auto& clusters = skinDeformer.clusters;
+                for (const auto& clusterID : clusterIDs) {
+                    HFMCluster hfmCluster;
+                    const Cluster& fbxCluster = fbxClusters[clusterID];
+
+                    // see http://stackoverflow.com/questions/13566608/loading-skinning-information-from-fbx for a discussion
+                    // of skinning information in FBX
+                    QString jointID = _connectionChildMap.value(clusterID);
+                    int indexOfJointID = modelIDs.indexOf(jointID);
+                    if (indexOfJointID == -1) {
+                        qCDebug(modelformat) << "Joint not in model list: " << jointID;
+                        hfmCluster.jointIndex = 0;
+                    } else {
+                        hfmCluster.jointIndex = (uint32_t)indexOfJointID;
+                    }
+
+                    const glm::mat4& transformForCluster = transformForClusters[transformIndex];
+                    hfmCluster.inverseBindMatrix = glm::inverse(fbxCluster.transformLink) * transformForCluster;
+
+                    // slam bottom row to (0, 0, 0, 1), we KNOW this is not a perspective matrix and
+                    // sometimes floating point fuzz can be introduced after the inverse.
+                    hfmCluster.inverseBindMatrix[0][3] = 0.0f;
+                    hfmCluster.inverseBindMatrix[1][3] = 0.0f;
+                    hfmCluster.inverseBindMatrix[2][3] = 0.0f;
+                    hfmCluster.inverseBindMatrix[3][3] = 1.0f;
+
+                    hfmCluster.inverseBindTransform = Transform(hfmCluster.inverseBindMatrix);
+
+                    clusters.push_back(hfmCluster);
+
+                    // override the bind rotation with the transform link
+                    HFMJoint& joint = hfmModel.joints[hfmCluster.jointIndex];
+                    joint.inverseBindRotation = glm::inverse(extractRotation(fbxCluster.transformLink));
+                    joint.bindTransform = fbxCluster.transformLink;
+                    joint.bindTransformFoundInCluster = true;
+
+                    // update the bind pose extents
+                    glm::vec3 bindTranslation = extractTranslation(hfmModel.offset * joint.bindTransform);
+                    hfmModel.bindExtents.addPoint(bindTranslation);
+                }
+
+                // the last cluster is the root cluster
+                HFMCluster cluster;
+                cluster.jointIndex = transformIndex;
+                clusters.push_back(cluster);
+
+                // Skinned mesh instances have an hfm::SkinDeformer
+                std::vector<hfm::SkinCluster> skinClusters;
+                for (const auto& clusterID : clusterIDs) {
+                    const Cluster& fbxCluster = fbxClusters[clusterID];
+                    skinClusters.emplace_back();
+                    hfm::SkinCluster& skinCluster = skinClusters.back();
+                    size_t indexWeightPairs = (size_t)std::min(fbxCluster.indices.size(), fbxCluster.weights.size());
+                    skinCluster.indices.reserve(indexWeightPairs);
+                    skinCluster.weights.reserve(indexWeightPairs);
+
+                    for (int j = 0; j < fbxCluster.indices.size(); j++) {
+                        int oldIndex = fbxCluster.indices.at(j);
+                        float weight = fbxCluster.weights.at(j);
+                        for (QMultiHash<int, int>::const_iterator it = extracted.newIndices.constFind(oldIndex);
                             it != extracted.newIndices.end() && it.key() == oldIndex; it++) {
-                        int newIndex = it.value();
+                            int newIndex = it.value();
 
-                        // remember vertices with at least 1/4 weight
-                        const float EXPANSION_WEIGHT_THRESHOLD = 0.25f;
-                        if (weight >= EXPANSION_WEIGHT_THRESHOLD) {
-                            // transform to joint-frame and save for later
-                            const glm::mat4 vertexTransform = meshToJoint * glm::translate(extracted.mesh.vertices.at(newIndex));
-                            points.push_back(extractTranslation(vertexTransform));
-                        }
-
-                        // look for an unused slot in the weights vector
-                        int weightIndex = newIndex * WEIGHTS_PER_VERTEX;
-                        int lowestIndex = -1;
-                        float lowestWeight = FLT_MAX;
-                        int k = 0;
-                        for (; k < WEIGHTS_PER_VERTEX; k++) {
-                            if (weightAccumulators[weightIndex + k] == 0.0f) {
-                                extracted.mesh.clusterIndices[weightIndex + k] = i;
-                                weightAccumulators[weightIndex + k] = weight;
-                                break;
-                            }
-                            if (weightAccumulators[weightIndex + k] < lowestWeight) {
-                                lowestIndex = k;
-                                lowestWeight = weightAccumulators[weightIndex + k];
-                            }
-                        }
-                        if (k == WEIGHTS_PER_VERTEX && weight > lowestWeight) {
-                            // no space for an additional weight; we must replace the lowest
-                            weightAccumulators[weightIndex + lowestIndex] = weight;
-                            extracted.mesh.clusterIndices[weightIndex + lowestIndex] = i;
+                            skinCluster.indices.push_back(newIndex);
+                            skinCluster.weights.push_back(weight);
                         }
                     }
                 }
-            }
-
-            // now that we've accumulated the most relevant weights for each vertex
-            // normalize and compress to 16-bits
-            extracted.mesh.clusterWeights.fill(0, numClusterIndices);
-            int numVertices = extracted.mesh.vertices.size();
-            for (int i = 0; i < numVertices; ++i) {
-                int j = i * WEIGHTS_PER_VERTEX;
-
-                // normalize weights into uint16_t
-                float totalWeight = weightAccumulators[j];
-                for (int k = j + 1; k < j + WEIGHTS_PER_VERTEX; ++k) {
-                    totalWeight += weightAccumulators[k];
-                }
-                if (totalWeight > 0.0f) {
-                    const float ALMOST_HALF = 0.499f;
-                    float weightScalingFactor = (float)(UINT16_MAX) / totalWeight;
-                    for (int k = j; k < j + WEIGHTS_PER_VERTEX; ++k) {
-                        extracted.mesh.clusterWeights[k] = (uint16_t)(weightScalingFactor * weightAccumulators[k] + ALMOST_HALF);
+                // It seems odd that this mesh-related code should be inside of the for loop for instanced model IDs.
+                // However, in practice, skinned FBX models appear to not be instanced, as the skinning includes both the weights and joints.
+                {
+                    hfm::ReweightedDeformers reweightedDeformers = hfm::getReweightedDeformers(mesh.vertices.size(), skinClusters);
+                    if (reweightedDeformers.trimmedToMatch) {
+                        qDebug(modelformat) << "FBXSerializer -- The number of indices and weights for a skinning deformer had different sizes and have been trimmed to match";
                     }
+                    mesh.clusterIndices = std::move(reweightedDeformers.indices);
+                    mesh.clusterWeights = std::move(reweightedDeformers.weights);
+                    mesh.clusterWeightsPerVertex = reweightedDeformers.weightsPerVertex;
+                }
+
+                // Store the model's dynamic transform, and put its ID in the shapes
+                uint32_t skinDeformerID = (uint32_t)hfmModel.skinDeformers.size();
+                hfmModel.skinDeformers.push_back(skinDeformer);
+                for (hfm::Shape& shape : partShapes) {
+                    shape.skinDeformer = skinDeformerID;
                 }
             }
-        } else {
-            // this is a single-mesh joint
-            int jointIndex = firstHFMCluster.jointIndex;
-            HFMJoint& joint = hfmModel.joints[jointIndex];
 
-            // transform cluster vertices to joint-frame and save for later
-            glm::mat4 meshToJoint = glm::inverse(joint.bindTransform) * modelTransform;
-            ShapeVertices& points = shapeVertices.at(jointIndex);
-            foreach (const glm::vec3& vertex, extracted.mesh.vertices) {
-                const glm::mat4 vertexTransform = meshToJoint * glm::translate(vertex);
-                points.push_back(extractTranslation(vertexTransform));
-            }
-
-            // Apply geometric offset, if present, by transforming the vertices directly
-            if (joint.hasGeometricOffset) {
-                glm::mat4 geometricOffset = createMatFromScaleQuatAndPos(joint.geometricScaling, joint.geometricRotation, joint.geometricTranslation);
-                for (int i = 0; i < extracted.mesh.vertices.size(); i++) {
-                    extracted.mesh.vertices[i] = transformPoint(geometricOffset, extracted.mesh.vertices[i]);
-                }
-            }
+            // Store the parts for this mesh (or instance of this mesh, as the case may be)
+            meshShapes.insert(meshShapes.cend(), partShapes.cbegin(), partShapes.cend());
         }
-        buildModelMesh(extracted.mesh, url);
 
-        hfmModel.meshes.append(extracted.mesh);
-        int meshIndex = hfmModel.meshes.size() - 1;
-        if (extracted.mesh._mesh) {
-            extracted.mesh._mesh->displayName = QString("%1#/mesh/%2").arg(url).arg(meshIndex).toStdString();
-            extracted.mesh._mesh->modelName = modelIDsToNames.value(modelID).toStdString();
-        }
-        meshIDsToMeshIndices.insert(it.key(), meshIndex);
+        // Store the shapes for the mesh (or multiple instances of the mesh, as the case may be)
+        hfmModel.shapes.insert(hfmModel.shapes.cend(), meshShapes.cbegin(), meshShapes.cend());
     }
-
-    const float INV_SQRT_3 = 0.57735026918f;
-    ShapeVertices cardinalDirections = {
-        Vectors::UNIT_X,
-        Vectors::UNIT_Y,
-        Vectors::UNIT_Z,
-        glm::vec3(INV_SQRT_3,  INV_SQRT_3,  INV_SQRT_3),
-        glm::vec3(INV_SQRT_3, -INV_SQRT_3,  INV_SQRT_3),
-        glm::vec3(INV_SQRT_3,  INV_SQRT_3, -INV_SQRT_3),
-        glm::vec3(INV_SQRT_3, -INV_SQRT_3, -INV_SQRT_3)
-    };
-
-    // now that all joints have been scanned compute a k-Dop bounding volume of mesh
-    for (int i = 0; i < hfmModel.joints.size(); ++i) {
-        HFMJoint& joint = hfmModel.joints[i];
-
-        // NOTE: points are in joint-frame
-        ShapeVertices& points = shapeVertices.at(i);
-        if (points.size() > 0) {
-            // compute average point
-            glm::vec3 avgPoint = glm::vec3(0.0f);
-            for (uint32_t j = 0; j < points.size(); ++j) {
-                avgPoint += points[j];
-            }
-            avgPoint /= (float)points.size();
-            joint.shapeInfo.avgPoint = avgPoint;
-
-            // compute a k-Dop bounding volume
-            for (uint32_t j = 0; j < cardinalDirections.size(); ++j) {
-                float maxDot = -FLT_MAX;
-                float minDot = FLT_MIN;
-                for (uint32_t k = 0; k < points.size(); ++k) {
-                    float kDot = glm::dot(cardinalDirections[j], points[k] - avgPoint);
-                    if (kDot > maxDot) {
-                        maxDot = kDot;
-                    }
-                    if (kDot < minDot) {
-                        minDot = kDot;
-                    }
-                }
-                joint.shapeInfo.points.push_back(avgPoint + maxDot * cardinalDirections[j]);
-                joint.shapeInfo.dots.push_back(maxDot);
-                joint.shapeInfo.points.push_back(avgPoint + minDot * cardinalDirections[j]);
-                joint.shapeInfo.dots.push_back(-minDot);
-            }
-            generateBoundryLinesForDop14(joint.shapeInfo.dots, joint.shapeInfo.avgPoint, joint.shapeInfo.debugLines);
-        }
-    }
-    hfmModel.palmDirection = parseVec3(mapping.value("palmDirection", "0, -1, 0").toString());
 
     // attempt to map any meshes to a named model
     for (QHash<QString, int>::const_iterator m = meshIDsToMeshIndices.constBegin();
@@ -1715,37 +1659,6 @@ HFMModel* FBXSerializer::extractHFMModel(const QVariantHash& mapping, const QStr
             }
         }
     }
-    {
-        int i = 0;
-        for (const auto& mesh : hfmModel.meshes) {
-            auto name = hfmModel.getModelNameOfMesh(i++);
-            if (!name.isEmpty()) {
-                if (mesh._mesh) {
-                    mesh._mesh->modelName = name.toStdString();
-                    if (!mesh._mesh->displayName.size()) {
-                        mesh._mesh->displayName = QString("#%1").arg(name).toStdString();
-                    }
-                } else {
-                    qDebug() << "modelName but no mesh._mesh" << name;
-                }
-            }
-        }
-    }
-
-    auto offsets = getJointRotationOffsets(mapping);
-    hfmModel.jointRotationOffsets.clear();
-    for (auto itr = offsets.begin(); itr != offsets.end(); itr++) {
-        QString jointName = itr.key();
-        glm::quat rotationOffset = itr.value();
-        int jointIndex = hfmModel.getJointIndex(jointName);
-        if (hfmModel.hfmToHifiJointNameMapping.contains(jointName)) {
-            jointIndex = hfmModel.getJointIndex(jointName);
-        }
-        if (jointIndex != -1) {
-            hfmModel.jointRotationOffsets.insert(jointIndex, rotationOffset);
-        }
-        qCDebug(modelformat) << "Joint Rotation Offset added to Rig._jointRotationOffsets : " << " jointName: " << jointName << " jointIndex: " << jointIndex << " rotation offset: " << rotationOffset;
-    }
 
     return hfmModelPtr;
 }
@@ -1761,11 +1674,13 @@ std::unique_ptr<hfm::Serializer::Factory> FBXSerializer::getFactory() const {
     return std::make_unique<hfm::Serializer::SimpleFactory<FBXSerializer>>();
 }
 
-HFMModel::Pointer FBXSerializer::read(const QByteArray& data, const QVariantHash& mapping, const QUrl& url) {
-    QBuffer buffer(const_cast<QByteArray*>(&data));
+HFMModel::Pointer FBXSerializer::read(const hifi::ByteArray& data, const hifi::VariantHash& mapping, const hifi::URL& url) {
+    QBuffer buffer(const_cast<hifi::ByteArray*>(&data));
     buffer.open(QIODevice::ReadOnly);
 
     _rootNode = parseFBX(&buffer);
+
+    // FBXSerializer's mapping parameter supports the bool "deduplicateIndices," which is passed into FBXSerializer::extractMesh as "deduplicate"
 
     return HFMModel::Pointer(extractHFMModel(mapping, url.toString()));
 }

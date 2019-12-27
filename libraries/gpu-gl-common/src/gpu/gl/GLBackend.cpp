@@ -117,9 +117,10 @@ void GLBackend::init() {
     static std::once_flag once;
     std::call_once(once, [] {
 
-
-        QString vendor{ (const char*)glGetString(GL_VENDOR) };
-        QString renderer{ (const char*)glGetString(GL_RENDERER) };
+        ::gl::ContextInfo contextInfo;
+        contextInfo.init();
+        QString vendor { contextInfo.vendor.c_str() };
+        QString renderer { contextInfo.renderer.c_str() };
 
         // Textures
         GL_GET_INTEGER(MAX_TEXTURE_IMAGE_UNITS);
@@ -131,10 +132,7 @@ void GLBackend::init() {
         GL_GET_INTEGER(MAX_UNIFORM_BLOCK_SIZE);
         GL_GET_INTEGER(UNIFORM_BUFFER_OFFSET_ALIGNMENT);
 
-        qCDebug(gpugllogging) << "GL Version: " << QString((const char*) glGetString(GL_VERSION));
-        qCDebug(gpugllogging) << "GL Shader Language Version: " << QString((const char*) glGetString(GL_SHADING_LANGUAGE_VERSION));
-        qCDebug(gpugllogging) << "GL Vendor: " << vendor;
-        qCDebug(gpugllogging) << "GL Renderer: " << renderer;
+        LOG_GL_CONTEXT_INFO(gpugllogging, contextInfo);
         GPUIdent* gpu = GPUIdent::getInstance(vendor, renderer); 
         // From here on, GPUIdent::getInstance()->getMumble() should efficiently give the same answers.
         qCDebug(gpugllogging) << "GPU:";
@@ -392,10 +390,47 @@ void GLBackend::renderPassDraw(const Batch& batch) {
     }
 }
 
+// Support annotating captures in tools like Renderdoc
+class GlDuration {
+public:
+#ifdef USE_GLES
+    GlDuration(const char* name) {
+        // We need to use strlen here instead of -1, because the Snapdragon profiler
+        // will crash otherwise 
+        glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, strlen(name), name);
+    }
+    ~GlDuration() {
+        glPopDebugGroup();
+    }
+#else
+    GlDuration(const char* name) {
+        if (::gl::khrDebugEnabled()) {
+            glPushDebugGroupKHR(GL_DEBUG_SOURCE_APPLICATION_KHR, 0, -1, name);
+        }
+    }
+    ~GlDuration() {
+        if (::gl::khrDebugEnabled()) {
+            glPopDebugGroupKHR();
+        }
+    }
+#endif
+};
+
+#if defined(GPU_STEREO_DRAWCALL_INSTANCED) && !defined(GL_CLIP_DISTANCE0)
+#define GL_CLIP_DISTANCE0 GL_CLIP_DISTANCE0_EXT
+#endif
+
+#define GL_PROFILE_RANGE(category, name) \
+    PROFILE_RANGE(category, name); \
+    GlDuration glProfileRangeThis(name);
+
 void GLBackend::render(const Batch& batch) {
-    PROFILE_RANGE(render_gpu_gl, batch.getName());
+    GL_PROFILE_RANGE(render_gpu_gl, batch.getName().c_str());
 
     _transform._skybox = _stereo._skybox = batch.isSkyboxEnabled();
+    // FIXME move this to between the transfer and draw passes, so that
+    // framebuffer setup can see the proper stereo state and enable things 
+    // like foveation
     // Allow the batch to override the rendering stereo settings
     // for things like full framebuffer copy operations (deferred lighting passes)
     bool savedStereo = _stereo._enable;
@@ -406,7 +441,7 @@ void GLBackend::render(const Batch& batch) {
     _transform._projectionJitter = Vec2(0.0f, 0.0f);
     
     {
-        PROFILE_RANGE(render_gpu_gl_detail, "Transfer");
+        GL_PROFILE_RANGE(render_gpu_gl_detail, "Transfer");
         renderPassTransfer(batch);
     }
 
@@ -416,7 +451,7 @@ void GLBackend::render(const Batch& batch) {
     }
 #endif
     {
-        PROFILE_RANGE(render_gpu_gl_detail, _stereo.isStereo() ? "Render Stereo" : "Render");
+        GL_PROFILE_RANGE(render_gpu_gl_detail, _stereo.isStereo() ? "Render Stereo" : "Render");
         renderPassDraw(batch);
     }
 #ifdef GPU_STEREO_DRAWCALL_INSTANCED

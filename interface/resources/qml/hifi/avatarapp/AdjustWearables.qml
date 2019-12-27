@@ -113,6 +113,7 @@ Rectangle {
                 } else if (prop === 'dimensions') {
                     scalespinner.set(wearable[prop].x / wearable.naturalDimensions.x);
                 }
+                modified = true;
             }
         }
 
@@ -157,7 +158,7 @@ Rectangle {
         visible = false;
         adjustWearablesClosed(status, avatarName);
     }
-    
+
 
     HifiConstants { id: hifi }
 
@@ -177,8 +178,9 @@ Rectangle {
         repeat: true
         onTriggered: {
             var currentWearable = getCurrentWearable();
-            var soft = currentWearable ? currentWearable.relayParentJoints : false;
-            var softEnabled = currentWearable ? entityHasAvatarJoints(currentWearable.id) : false;
+            var hasSoft = currentWearable && currentWearable.relayParentJoints !== undefined;
+            var soft = hasSoft ? currentWearable.relayParentJoints : false;
+            var softEnabled = hasSoft ? entityHasAvatarJoints(currentWearable.id) : false;
             isSoft.set(soft);
             isSoft.enabled = softEnabled;
         }
@@ -230,7 +232,7 @@ Rectangle {
                     lineHeightMode: Text.FixedHeight
                     lineHeight: 18;
                     text: "Wearable"
-                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.alignment: Qt.AlignVCenter
                 }
 
                 spacing: 10
@@ -241,11 +243,9 @@ Rectangle {
                     lineHeight: 18;
                     text: "<a href='#'>Get more</a>"
                     linkColor: hifi.colors.blueHighlight
-                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.alignment: Qt.AlignVCenter
                     onLinkActivated: {
-                        popup.showGetWearables(function() {
-                            emitSendToScript({'method' : 'navigate', 'url' : 'hifi://AvatarIsland/11.5848,-8.10862,-2.80195'})
-                        }, function(link) {
+                        popup.showGetWearables(null, function(link) {
                             emitSendToScript({'method' : 'navigate', 'url' : link})
                         });
                     }
@@ -511,7 +511,7 @@ Rectangle {
 
                 function set(value) {
                     notify = false;
-                    checked = value
+                    checked = value;
                     notify = true;
                 }
 
